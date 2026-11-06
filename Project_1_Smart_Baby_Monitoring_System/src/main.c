@@ -23,6 +23,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/debug/thread_analyzer.h>
 #include <stm32f4xx.h>
 
 #include "lcd_st7789.h"
@@ -45,6 +46,7 @@
 #define UI_PERIOD_MS         100U
 #define STATUS_PERIOD_MS     1000U
 #define HEARTBEAT_DIVIDER    5U    /* status cycles per console heartbeat (5 s) */
+#define STACK_DUMP_DIVIDER   30U   /* status cycles per stack high-water dump  */
 
 /* ---------------------------------------------------------------- shared state */
 /* K_THREAD_DEFINE threads start before main() returns; they park here until the
@@ -159,6 +161,15 @@ static void status_thread_fn(void *p1, void *p2, void *p3)
         if ((cycle % HEARTBEAT_DIVIDER) == 0U) {
             printk("[APP] heartbeat: uptime %u s (cycle %u)\n",
                    (unsigned)(k_uptime_get_32() / 1000U), (unsigned)cycle);
+        }
+
+        /* P7 evidence: per-thread stack high-water marks (requires
+         * CONFIG_INIT_STACKS + CONFIG_THREAD_ANALYZER). One full table
+         * dump every 30 s. */
+        if ((cycle % STACK_DUMP_DIVIDER) == 0U) {
+            printk("[STACK] high-water marks @ %u s:\n",
+                   (unsigned)(k_uptime_get_32() / 1000U));
+            thread_analyzer_print(0U); /* cpu 0: single-core STM32F407 */
         }
 
         sleep_until(&next_wake, STATUS_PERIOD_MS);
