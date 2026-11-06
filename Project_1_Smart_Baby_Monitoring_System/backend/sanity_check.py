@@ -81,17 +81,17 @@ def main() -> int:
 
         # --- /api/history ------------------------------------------------
         r = client.get("/api/history")  # default 60 min -> all 20 synthetic rows
-        rows = r.json()
+        rows = r.json()["readings"]  # wrapped per the frozen P5/P6 contract
         check("history default = 20 rows", isinstance(rows, list) and len(rows) == 20, str(len(rows)))
         check("history newest-first", rows[0]["recv_ms"] >= rows[-1]["recv_ms"])
         check("history newest age ~5 s", 0 <= NOW_MS - rows[0]["recv_ms"] < 10_000)
         check("history field set", set(rows[0]) == {"id", "recv_ms", "t", "h", "lux", "px", "mg", "dev_ts"})
 
         r = client.get("/api/history?minutes=2")  # window 120 s -> 2 rows (5 s + 65 s old)
-        check("history minutes=2 -> 2 rows", len(r.json()) == 2, str(len(r.json())))
+        check("history minutes=2 -> 2 rows", len(r.json()["readings"]) == 2, str(r.json()))
 
         r = client.get("/api/history?minutes=999999")  # clamp to 1440
-        check("history window clamped to 1440 min", len(r.json()) == 20)
+        check("history window clamped to 1440 min", len(r.json()["readings"]) == 20)
 
         # Row cap: insert 30 extra stale-free rows, still capped at 2000.
         conn = sqlite3.connect(os.environ["BABYMONITOR_DB"])
@@ -102,7 +102,7 @@ def main() -> int:
         conn.commit()
         conn.close()
         r = client.get("/api/history?minutes=1440")
-        check("history capped at 2000 rows", len(r.json()) == 2000, str(len(r.json())))
+        check("history capped at 2000 rows", len(r.json()["readings"]) == 2000, str(len(r.json()["readings"])))
 
         # --- /api/latest -------------------------------------------------
         r = client.get("/api/latest")
@@ -120,11 +120,11 @@ def main() -> int:
 
         # --- /api/events -------------------------------------------------
         r = client.get("/api/events?limit=2")
-        ev = r.json()
+        ev = r.json()["events"]  # wrapped per the frozen P5/P6 contract
         check("events limit=2", len(ev) == 2)
         check("events newest-first", ev[0]["recv_ms"] >= ev[1]["recv_ms"])
         r = client.get("/api/events?limit=0")  # clamp up to 1
-        check("events limit clamped to >=1", len(r.json()) == 1)
+        check("events limit clamped to >=1", len(r.json()["events"]) == 1)
 
         # --- /api/mute validation (offline -> 503 after validation) ------
         r = client.post("/api/mute")  # missing body

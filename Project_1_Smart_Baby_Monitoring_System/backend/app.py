@@ -298,7 +298,14 @@ app.add_middleware(
 
 
 def _row_dict(row: sqlite3.Row | None) -> dict | None:
-    return None if row is None else {k: row[k] for k in row.keys()}
+    if row is None:
+        return None
+    d = {k: row[k] for k in row.keys()}
+    # Contract alias: the P6 app parses "on" (boolean); the DB column is
+    # "on_flag" (0/1, named around the SQL keyword). Emit both spellings.
+    if "on_flag" in d:
+        d["on"] = bool(d["on_flag"])
+    return d
 
 
 @app.get("/")
@@ -342,10 +349,11 @@ def api_latest() -> dict:
 
 
 @app.get("/api/history")
-def api_history(minutes: int = 60) -> list[dict]:
+def api_history(minutes: int = 60) -> dict:
     """Readings newest-first from the last `minutes` minutes.
 
     Default 60, window clamped to 1..1440; response capped at 2000 rows.
+    Wrapped as {"readings":[...]} per the frozen P5/P6 contract.
     """
     minutes = max(1, min(minutes, HISTORY_MAX_MINUTES))
     since_ms = int(time.time() * 1000) - minutes * 60_000
@@ -355,19 +363,22 @@ def api_history(minutes: int = 60) -> list[dict]:
             "ORDER BY recv_ms DESC, id DESC LIMIT ?",
             (since_ms, HISTORY_MAX_ROWS),
         ).fetchall()
-    return [_row_dict(r) for r in rows]
+    return {"readings": [_row_dict(r) for r in rows]}
 
 
 @app.get("/api/events")
-def api_events(limit: int = EVENTS_DEFAULT_LIMIT) -> list[dict]:
-    """Events newest-first. Default limit 50, clamped to 1..1000."""
+def api_events(limit: int = EVENTS_DEFAULT_LIMIT) -> dict:
+    """Events newest-first. Default limit 50, clamped to 1..1000.
+
+    Wrapped as {"events":[...]} per the frozen P5/P6 contract.
+    """
     limit = max(1, min(limit, EVENTS_MAX_LIMIT))
     with _db() as conn:
         rows = conn.execute(
             "SELECT * FROM events ORDER BY recv_ms DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
-    return [_row_dict(r) for r in rows]
+    return {"events": [_row_dict(r) for r in rows]}
 
 
 @app.post("/api/ack")
