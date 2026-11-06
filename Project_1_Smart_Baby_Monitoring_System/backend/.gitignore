@@ -1,0 +1,6 @@
+# Local runtime artifacts (P5 backend)
+babymonitor.db
+babymonitor.db-wal
+babymonitor.db-shm
+__pycache__/
+*.pyc
