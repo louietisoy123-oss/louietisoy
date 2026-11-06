@@ -13,15 +13,15 @@
 #ifndef CRY_TASK_H_
 #define CRY_TASK_H_
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Confidence (CRY-vote %) above which a 1 s window counts as "cry".
- * 70 was too strict for the v1 model (frozen-test recall 0.29): 50 opens
- * the gate for live diagnosis; the retrained model ships with its own
- * val-tuned value. */
-#define CRY_CONF_THRESHOLD 73u
+/* Default confidence (CRY-vote %) above which a 1 s window counts as "cry".
+ * Configurable at runtime via the captive portal (default 80%). */
+#define CRY_CONF_THRESHOLD 80u
 
 /**
  * No-op by design: the thread is created at build time via
@@ -29,6 +29,12 @@ extern "C" {
  * site in main() documents the bring-up order.
  */
 void cry_task_start(void);
+
+/** Current cry status threshold percentage (10..99, default 80). */
+uint8_t cry_task_get_threshold(void);
+
+/** Update the cry status threshold percentage at runtime (clamped 10..99). */
+void cry_task_set_threshold(uint8_t pct);
 
 #ifdef __cplusplus
 }

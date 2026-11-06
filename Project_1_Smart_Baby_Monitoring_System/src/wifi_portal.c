@@ -36,6 +36,8 @@
 #include "rw007_netif.h"
 #include "monitor_state.h"
 #include "baby_logic.h"
+#include "cry_task.h"
+#include "watchdog.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/net/net_if.h>
@@ -69,6 +71,12 @@
 #define REQ_MAX         1024
 #define MAX_CONN        2
 #define CONN_IDLE_MS    8000
+
+#if defined(__arm__)
+#define PORTAL_DTCM __attribute__((section(".dtcm_noinit"), aligned(4)))
+#else
+#define PORTAL_DTCM
+#endif
 
 /* ---------------------------------------------------------- portal state */
 static wifi_portal_result_t s_result;
@@ -156,41 +164,9 @@ static void send_all(int fd, const char *data, size_t len)
     }
 }
 
-/* Streaming emit: one fmt chunk per call, written straight after a fixed
- * 200 OK header (body is delimited by Connection: close + FIN). The portal
- * is single-threaded, so the shared chunk buffer and header latch need no
- * lock. http_begin() arms the latch at the start of each streamed response. */
-static bool s_http_header_pending;
-
-static void http_begin(void)
-{
-    s_http_header_pending = true;
-}
-
-static void http_emit(int fd, const char *fmt, ...)
-{
-    static char chunk[640]; /* every emitted chunk stays below this cap */
-
-    va_list ap;
-    va_start(ap, fmt);
-    int len = vsnprintf(chunk, sizeof(chunk), fmt, ap);
-    va_end(ap);
-    if (len < 0) {
-        return;
-    }
-    if (s_http_header_pending) {
-        static const char HDR[] =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=utf-8\r\n"
-            "Connection: close\r\n\r\n";
-        send_all(fd, HDR, sizeof(HDR) - 1);
-        s_http_header_pending = false;
-    }
-    send_all(fd, chunk, (size_t)((len < (int)sizeof(chunk)) ? len : (int)sizeof(chunk) - 1));
-}
-
-/* Small fixed pages (save confirmation, mute confirmation) can carry an
- * exact Content-Length. */
+/* Deliver an HTML body with an exact Content-Length header (Lab 3 pattern:
+ * avoids multi-chunk TCP fragmentation and lets mobile Captive Portal WebViews
+ * render immediately). */
 static void send_static_page(int fd, const char *body)
 {
     char hdr[128];
@@ -247,7 +223,8 @@ static void current_broker(char *host, size_t cap, uint16_t *port)
 
 static void send_portal_page(int fd)
 {
-    static rw007_ap_entry_t aps[RW007_MAX_SCAN_APS];
+    static PORTAL_DTCM rw007_ap_entry_t aps[RW007_MAX_SCAN_APS];
+    static PORTAL_DTCM char html_buf[2400];
     const int n_aps = rw007_wifi_get_scan_aps(aps, RW007_MAX_SCAN_APS);
 
     char broker_ph[WIFI_BROKER_HOST_MAX_LEN];
@@ -257,28 +234,27 @@ static void send_portal_page(int fd)
 
     current_broker(broker_ph, sizeof(broker_ph), &broker_port);
     html_escape(broker_ph, esc, sizeof(esc));
-    http_begin();
-    http_emit(fd,
+
+    int len = snprintf(html_buf, sizeof(html_buf),
         "<!DOCTYPE html><html><head>"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>Baby Monitor Setup</title>");
-    http_emit(fd, PAGE_STYLE);
-    http_emit(fd,
+        "<title>Baby Monitor Setup</title>%s"
         "</head><body><div class=\"c\">"
         "<h2 style=\"color:#10b981;margin-top:0\">Baby Monitor Setup</h2>"
         "<form method=\"POST\" action=\"/save\">"
         "<label>Wi-Fi network:</label>"
         "<select onchange=\"if(this.value)document.getElementById('ssid').value=this.value;\">"
         "<option value=\"\">-- Select Network (%d found) --</option>",
-        n_aps);
+        PAGE_STYLE, n_aps);
 
-    for (int i = 0; i < n_aps; i++) {
+    for (int i = 0; i < n_aps && len < (int)sizeof(html_buf) - 700; i++) {
         html_escape(aps[i].ssid, ssid_esc, sizeof(ssid_esc));
-        http_emit(fd, "<option value=\"%s\">%s (%d dBm)</option>",
-                  ssid_esc, ssid_esc, aps[i].rssi);
+        len += snprintf(html_buf + len, sizeof(html_buf) - (size_t)len,
+                        "<option value=\"%s\">%s (%d dBm)</option>",
+                        ssid_esc, ssid_esc, aps[i].rssi);
     }
 
-    http_emit(fd,
+    len += snprintf(html_buf + len, sizeof(html_buf) - (size_t)len,
         "</select>"
         "<input id=\"ssid\" name=\"ssid\" placeholder=\"Or enter SSID manually\" required>"
         "<input name=\"pass\" type=\"password\" placeholder=\"Wi-Fi Password\">"
@@ -286,12 +262,16 @@ static void send_portal_page(int fd)
         "<input name=\"broker\" placeholder=\"%s\">"
         "<label>MQTT broker port:</label>"
         "<input name=\"bport\" type=\"number\" value=\"%u\">"
+        "<label>Cry status threshold (%%, default 80):</label>"
+        "<input name=\"cthr\" type=\"number\" min=\"10\" max=\"99\" value=\"%u\">"
         "<button type=\"submit\">Save &amp; Connect</button>"
-        "</form><hr>",
-        esc, (unsigned)broker_port);
-
-    /* Buzzer-silence section (POST /mute, mirrors the remote-mute path). */
-    http_emit(fd,
+        "</form><hr>"
+        "<h2 style=\"color:#38bdf8\">Cry Status Threshold</h2>"
+        "<form method=\"POST\" action=\"/threshold\">"
+        "<label>Cry confidence threshold (10-99%%, default 80):</label>"
+        "<input name=\"cthr\" type=\"number\" min=\"10\" max=\"99\" value=\"%u\">"
+        "<button type=\"submit\">Update Threshold</button>"
+        "</form><hr>"
         "<h2 style=\"color:#f59e0b\">Buzzer</h2>"
         "<form method=\"POST\" action=\"/mute\">"
         "<label>Silence buzzer for:</label>"
@@ -302,7 +282,13 @@ static void send_portal_page(int fd)
         "<option value=\"480\">8 hours</option>"
         "</select>"
         "<button type=\"submit\" class=\"mute\">Silence</button>"
-        "</form></div></body></html>");
+        "</form></div></body></html>",
+        esc, (unsigned)broker_port,
+        (unsigned)cry_task_get_threshold(),
+        (unsigned)cry_task_get_threshold());
+    (void)len;
+
+    send_static_page(fd, html_buf);
 }
 
 /* ------------------------------------------------------------- handlers   */
@@ -325,6 +311,31 @@ static void portal_apply_mute(uint32_t mute_ms)
     st->mute_until_ms = now + mute_ms;
     st->buzzer_on = baby_logic_buzzer_on(st->state, now);
     monitor_state_unlock();
+}
+
+static const char PAGE_THRESHOLD[] =
+    "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<style>body{background:#0B0F19;color:#38BDF8;font-family:sans-serif;text-align:center;padding:40px}"
+    "a{color:#10B981}</style></head><body><h2>Threshold updated</h2>"
+    "<p style=color:#fff>The cry detection confidence threshold has been updated.</p>"
+    "<p><a href=\"http://" SETUP_PORTAL_IP "/\">Back to setup page</a></p></body></html>";
+
+static void handle_threshold(int fd, const char *body)
+{
+    char val[8];
+    uint8_t thr = CRY_CONF_THRESHOLD;
+
+    if (form_field(body, "cthr", val, sizeof(val))) {
+        long v = atol(val);
+        if (v >= 10 && v <= 99) {
+            thr = (uint8_t)v;
+        }
+    }
+    cry_task_set_threshold(thr);
+    wifi_storage_set_cry_threshold(thr);
+    printk("[PORTAL] cry status threshold updated to %u%% via portal\n",
+           (unsigned)thr);
+    send_static_page(fd, PAGE_THRESHOLD);
 }
 
 static void handle_mute(int fd, const char *body)
@@ -365,14 +376,26 @@ static void handle_save(int fd, const char *body)
                 s_result.broker_port = (uint16_t)p;
             }
         }
+        s_result.cry_threshold = cry_task_get_threshold();
+        char thr_val[8];
+        if (form_field(body, "cthr", thr_val, sizeof(thr_val))) {
+            long t = atol(thr_val);
+            if (t >= 10 && t <= 99) {
+                s_result.cry_threshold = (uint8_t)t;
+            }
+        }
+        cry_task_set_threshold(s_result.cry_threshold);
+        wifi_storage_set_cry_threshold(s_result.cry_threshold);
+
         /* Empty host keeps the previously saved broker preference: the form
          * placeholder shows the current value, so blank = "keep current". */
         s_result.valid = true;
         s_got_save = true;
-        printk("[PORTAL] save: ssid '%s' broker '%s' port %u\n",
+        printk("[PORTAL] save: ssid '%s' broker '%s' port %u cry_thr %u%%\n",
                s_result.ssid,
                s_result.broker_host[0] ? s_result.broker_host : "(keep)",
-               (unsigned)s_result.broker_port);
+               (unsigned)s_result.broker_port,
+               (unsigned)s_result.cry_threshold);
         send_static_page(fd,
             "<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\">"
             "<style>body{background:#0B0F19;color:#10B981;font-family:sans-serif;text-align:center;padding:40px}</style>"
@@ -416,6 +439,10 @@ static void handle_request(int fd, char *req)
         handle_save(fd, body + 4);
         return;
     }
+    if (strncmp(req, "POST /threshold", 15) == 0 && body) {
+        handle_threshold(fd, body + 4);
+        return;
+    }
     if (strncmp(req, "POST /mute", 10) == 0 && body) {
         handle_mute(fd, body + 4);
         return;
@@ -432,7 +459,7 @@ struct conn {
     char buf[REQ_MAX];
 };
 
-static struct conn s_conn[MAX_CONN];
+static PORTAL_DTCM struct conn s_conn[MAX_CONN];
 
 static void conn_close(struct conn *c)
 {
@@ -632,6 +659,7 @@ bool wifi_portal_run(uint32_t timeout_sec, wifi_portal_result_t *out)
     int64_t next_stats = k_uptime_get() + 5000;
 
     while (!s_got_save && k_uptime_get() < end) {
+        watchdog_progress_named("net"); /* portal runs inside the net thread */
         struct zsock_pollfd pfd[2 + MAX_CONN];
         int nfd = 0;
 

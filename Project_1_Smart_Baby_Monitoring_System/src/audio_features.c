@@ -325,30 +325,33 @@ void audio_features_compute(const int16_t *window, uint32_t n, float *out)
         }
 
         /* (2b) v2 spectral shape on the raw power spectrum (stage 10 of
-         * the file header).  Accumulated in double for parity with
-         * numpy's float64 reductions.  A zero-power frame contributes 0
-         * to every accumulator (guards -> all three features 0). */
+         * the file header).  Inner loop uses hardware FPU float + logf()
+         * on Cortex-M4F (15,677 bins/window) and widens to double only for
+         * the per-frame reductions.  A zero-power frame contributes 0 to
+         * every accumulator (guards -> all three features 0). */
         {
-            double p_sum = 0.0;
-            double wf_sum = 0.0;
-            double log_sum = 0.0;
+            float p_sum_f = 0.0f;
+            float wf_sum_f = 0.0f;
+            float log_sum_f = 0.0f;
 
             for (i = 0u; i < AF_N_BINS; i++) {
-                const double p = (double)fft_re[i];
-                p_sum += p;
-                wf_sum += p * ((double)i * AF_BIN_HZ);
-                log_sum += log(p);  /* log(0) = -inf, as numpy: geo -> 0 */
+                const float p = fft_re[i];
+                p_sum_f += p;
+                wf_sum_f += p * ((float)i * (float)AUDIO_TABLES_BIN_HZ);
+                log_sum_f += logf(p);  /* logf(0) = -inf, as numpy: geo -> 0 */
             }
-            if (p_sum > 0.0) {
-                const double centroid = wf_sum / p_sum;
-                const double geo = exp(log_sum / (double)AF_N_BINS);
+            if (p_sum_f > 0.0f) {
+                const double p_sum = (double)p_sum_f;
+                const double centroid = (double)wf_sum_f / p_sum;
+                const double geo = (double)expf(log_sum_f * (1.0f / (float)AF_N_BINS));
                 const double flat = geo / (p_sum / (double)AF_N_BINS);
                 double roll = 0.0;
-                double acc = 0.0;
+                float acc = 0.0f;
+                const float target = (float)AF_ROLLOFF_FRAC * p_sum_f;
 
                 for (i = 0u; i < AF_N_BINS; i++) {
-                    acc += (double)fft_re[i];
-                    if (acc >= AF_ROLLOFF_FRAC * p_sum) {
+                    acc += fft_re[i];
+                    if (acc >= target) {
                         break;
                     }
                 }
@@ -364,27 +367,32 @@ void audio_features_compute(const int16_t *window, uint32_t n, float *out)
         }
 
         /* (3) 40-mel filterbank + natural log with the 1e-10 floor.
-         * Accumulated in double for parity with numpy's float64 BLAS. */
+         * Dot product runs in single-precision float so Cortex-M4F hardware
+         * VFMA.F32 executes the 627,080 MACs/window in ~4 ms instead of
+         * ~320 ms of software double emulation. */
         for (uint32_t m = 0u; m < AF_N_MELS; m++) {
             const float *fb = audio_feat_mel_fb[m];
-            double acc = 0.0;
+            float acc = 0.0f;
             for (i = 0u; i < AF_N_BINS; i++) {
-                acc += (double)fft_re[i] * (double)fb[i];
+                acc += fft_re[i] * fb[i];
             }
-            mel_log[m] = log(acc + AF_LOG_FLOOR_MEL);
+            mel_log[m] = (double)logf(acc + (float)AF_LOG_FLOOR_MEL);
         }
 
         /* (4) orthonormal DCT-II -> 13 MFCCs; accumulate window sums and
          * keep the frame sequence for the v2 deltas (stage 9). */
         for (uint32_t j = 0u; j < AF_N_MFCC; j++) {
             const float *dct_row = audio_feat_dct_mat[j];
-            double v = 0.0;
+            float v_f = 0.0f;
             for (uint32_t m = 0u; m < AF_N_MELS; m++) {
-                v += mel_log[m] * (double)dct_row[m];
+                v_f += (float)mel_log[m] * dct_row[m];
             }
-            mfcc_sum[j] += v;
-            mfcc_sq[j] += v * v;
-            mfcc_hist[j][f] = (float)v;
+            {
+                const double v = (double)v_f;
+                mfcc_sum[j] += v;
+                mfcc_sq[j] += v * v;
+                mfcc_hist[j][f] = v_f;
+            }
         }
 
         /* (5) frame log-energy (time-domain windowed energy, 1e-12 floor)

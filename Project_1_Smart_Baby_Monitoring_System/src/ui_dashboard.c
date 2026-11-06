@@ -300,10 +300,70 @@ void ui_dashboard_update(const monitor_state_t *s)
 		flag = "NET";
 		flag_color = s->net_online ? LCD_COLOR_GREEN : LCD_COLOR_GRAY;
 	}
-	if (strcmp(flag, s_last_flag) != 0 ||
-	    flag_color != s_last_flag_color) {
-		lcd_show_string(NET_X, UP_Y, flag, flag_color, BG);
-		snprintf(s_last_flag, sizeof(s_last_flag), "%s", flag);
-		s_last_flag_color = flag_color;
+		if (strcmp(flag, s_last_flag) != 0 ||
+		    flag_color != s_last_flag_color) {
+			lcd_show_string(NET_X, UP_Y, flag, flag_color, BG);
+			snprintf(s_last_flag, sizeof(s_last_flag), "%s", flag);
+			s_last_flag_color = flag_color;
+		}
+}
+
+void ui_dashboard_show_reset_confirm(const char *current_ssid, int countdown_sec)
+{
+	static int s_last_drawn = -1;
+
+	if (countdown_sec <= 0) {
+		s_last_drawn = -1;
+		return;
+	}
+
+	if (countdown_sec != s_last_drawn) {
+		if (s_last_drawn < 0) {
+			/* Full screen layout (ported from Lab 3 ui_dashboard.c) */
+			lcd_clear(LCD_COLOR_BLACK);
+
+			/* Top Banner: Amber / Orange */
+			lcd_fill_rect(0, 0, 239, 25, LCD_COLOR_ORANGE);
+			lcd_show_string(36, 5, "RECONFIGURE WI-FI?",
+					LCD_COLOR_BLACK, LCD_COLOR_ORANGE);
+
+			/* Card Outline */
+			lcd_draw_rect(10, 36, 229, 206, LCD_COLOR_ORANGE);
+			lcd_draw_rect(11, 37, 228, 205, LCD_COLOR_ORANGE);
+
+			/* Informative text */
+			lcd_show_string(24, 46, "Current Network:",
+					LCD_COLOR_LIGHTGREY, LCD_COLOR_BLACK);
+			char sbuf[32];
+			snprintf(sbuf, sizeof(sbuf), "\"%.20s\"",
+				 (current_ssid && current_ssid[0])
+					 ? current_ssid
+					 : "None");
+			lcd_show_string(24, 66, sbuf, LCD_COLOR_GREEN,
+					LCD_COLOR_BLACK);
+
+			lcd_show_string(24, 92, "Start BabyMon-Setup AP?",
+					LCD_COLOR_WHITE, LCD_COLOR_BLACK);
+
+			/* Action Buttons Visual */
+			lcd_fill_rect(20, 118, 219, 148, LCD_COLOR_DARKGREEN);
+			lcd_draw_rect(20, 118, 219, 148, LCD_COLOR_GREEN);
+			lcd_show_string(28, 126, "[KEY0] CONFIRM & RESET",
+					LCD_COLOR_WHITE, LCD_COLOR_DARKGREEN);
+
+			lcd_fill_rect(20, 158, 219, 188, LCD_COLOR_MAROON);
+			lcd_draw_rect(20, 158, 219, 188, LCD_COLOR_RED);
+			lcd_show_string(32, 166, "[KEY1] CANCEL & RESUME",
+					LCD_COLOR_WHITE, LCD_COLOR_MAROON);
+		}
+
+		/* Dynamic Countdown Line */
+		char cbuf[32];
+		snprintf(cbuf, sizeof(cbuf), "Auto-cancelling in %ds...",
+			 countdown_sec);
+		lcd_fill_rect(24, 218, 220, 234, LCD_COLOR_BLACK);
+		lcd_show_string(28, 218, cbuf, LCD_COLOR_GRAY, LCD_COLOR_BLACK);
+
+		s_last_drawn = countdown_sec;
 	}
 }

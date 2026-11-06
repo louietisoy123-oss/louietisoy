@@ -63,6 +63,18 @@ void watchdog_progress(int slot)
 	}
 }
 
+/* Name-based progress mark: lets code that cannot see the slot index (the
+ * captive portal, which runs inside the net thread) keep its owner alive. */
+void watchdog_progress_named(const char *name)
+{
+	for (int i = 0; i < WDT_MAX_THREADS; i++) {
+		if (s_slots[i].used && strcmp(s_slots[i].name, name) == 0) {
+			s_slots[i].progress++;
+			return;
+		}
+	}
+}
+
 void watchdog_init(void)
 {
 	s_wdt = DEVICE_DT_GET(DT_NODELABEL(iwdg));
@@ -93,6 +105,9 @@ void watchdog_init(void)
 
 	s_wdt_ok = true;
 	s_last_feed_ms = k_uptime_get_32();
+	/* Start the liveness window now: otherwise the first feed check runs
+	 * immediately and flags threads that have not reported progress yet. */
+	s_last_hb = s_last_feed_ms;
 	printk("[WDT] IWDG armed (%u s timeout, %d channels)\n",
 	       (unsigned)WDT_TIMEOUT_S, s_wdt_channel);
 }

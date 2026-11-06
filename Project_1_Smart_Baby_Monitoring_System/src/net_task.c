@@ -69,6 +69,7 @@
 #include "rw007_netif.h"
 #include "wifi_portal.h"
 #include "wifi_storage.h"
+#include "watchdog.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -191,6 +192,17 @@ static void net_take_offline(void)
     publish_net_state(false);
 }
 
+/* Watchdog-safe pause: sleeps in 1 s steps and marks liveness each step, so
+ * a long backoff (up to 30 s) never looks like a wedged thread to the IWDG
+ * supervisor (16 s window). */
+static void net_pause_s(uint32_t seconds)
+{
+    for (uint32_t i = 0; i < seconds && !s_portal_requested; i++) {
+        k_sleep(K_SECONDS(1));
+        watchdog_progress_named("net");
+    }
+}
+
 /* ------------------------------------------------------------- scan summary  */
 /* The driver already printks every discovered AP; this sorts the deduplicated
  * result by RSSI (strongest first) and logs the top few as a one-glance
@@ -267,7 +279,13 @@ static bool join_and_get_ip(void)
     k_sem_reset(&s_ip_sem);
     rw007_netif_link(true);
     net_dhcpv4_start(iface);
-    if (k_sem_take(&s_ip_sem, K_SECONDS(NET_DHCP_TIMEOUT_S)) != 0) {
+    /* Lease wait in 1 s steps (watchdog liveness; 20 s > 16 s IWDG window). */
+    bool leased = false;
+    for (uint32_t i = 0; i < NET_DHCP_TIMEOUT_S && !leased && !s_portal_requested; i++) {
+        leased = (k_sem_take(&s_ip_sem, K_SECONDS(1)) == 0);
+        watchdog_progress_named("net");
+    }
+    if (!leased) {
         printk("[NET] associated but no DHCP lease\n");
         net_dhcpv4_stop(iface);
         rw007_netif_link(false);
@@ -294,14 +312,14 @@ static bool join_and_get_ip(void)
  * connect_with_retries pattern). */
 static bool join_burst(uint32_t attempts)
 {
-    for (uint32_t attempt = 1u; attempt <= attempts; attempt++) {
+    for (uint32_t attempt = 1u; attempt <= attempts && !s_portal_requested; attempt++) {
         printk("[NET] join attempt %u/%u for '%s'\n",
                (unsigned)attempt, (unsigned)attempts, s_ssid);
         if (join_and_get_ip()) {
             return true;
         }
-        if (attempt < attempts) {
-            k_sleep(K_SECONDS(NET_JOIN_RETRY_GAP_S));
+        if (attempt < attempts && !s_portal_requested) {
+            net_pause_s(NET_JOIN_RETRY_GAP_S);
         }
     }
     return false;
@@ -368,9 +386,11 @@ static void net_thread_fn(void *p1, void *p2, void *p3)
      * flag is needed; the fixed park keeps the boot loopback demo
      * (record + playback + codec powerdown, ends ~8-9 s after boot) clear of
      * SPI/Wi-Fi traffic. Documented acceptable simplification. */
+    /* Register first so the IWDG supervisor sees this thread from the start. */
+    (void)watchdog_register_thread("net");
     printk("[NET] thread entered (gate %u s)\n", NET_BOOT_GATE_S);
     for (uint32_t gi = 0; gi < NET_BOOT_GATE_S; gi++) {
-        k_sleep(K_SECONDS(1));
+        net_pause_s(1);
         printk("[NET] gate %u/%u\n", (unsigned)(gi + 1),
                (unsigned)NET_BOOT_GATE_S);
     }
@@ -395,19 +415,30 @@ static void net_thread_fn(void *p1, void *p2, void *p3)
     printk("[NET] creds loaded\n");
 
     for (;;) {
-        /* On-demand portal (KEY0 held 3 s): overrides everything. */
+        /* On-demand portal (KEY0 reconfigure confirm): overrides everything. */
         if (s_portal_requested) {
             s_portal_requested = false;
             if (s_joined) {
+                net_take_offline();
                 s_joined = false;
+            }
+            load_best_creds();
+            if (!hw_up) {
+                hw_up = rw007_wifi_init();
+                if (hw_up) {
+                    (void)rw007_wifi_scan();
+                    log_scan_top();
+                }
             }
             printk("[NET] portal requested -- opening config portal "
                    "(%u s window)\n", (unsigned)NET_PORTAL_WINDOW_S);
             if (wifi_portal_run(NET_PORTAL_WINDOW_S, &res) && res.valid) {
                 try_verify_and_save(&res);
+            } else {
+                load_best_creds();
             }
             s_backoff_s = NET_RETRY_MIN_S;
-            k_sleep(K_SECONDS(1));
+            net_pause_s(1);
             continue; /* rejoin / re-supervise with (possibly new) creds */
         }
         if (!hw_up) {
@@ -415,7 +446,7 @@ static void net_thread_fn(void *p1, void *p2, void *p3)
             if (!hw_up) {
                 printk("[NET] RW007 init failed, retry in %u s\n",
                        (unsigned)NET_INIT_RETRY_S);
-                k_sleep(K_SECONDS(NET_INIT_RETRY_S));
+                net_pause_s(NET_INIT_RETRY_S);
                 continue;
             }
             printk("[NET] RW007 ready: '%s' sn '%s'\n",
@@ -437,7 +468,7 @@ static void net_thread_fn(void *p1, void *p2, void *p3)
                     continue; /* verified + saved: supervise at loop bottom */
                 }
             }
-            k_sleep(K_SECONDS(s_backoff_s));
+            net_pause_s(s_backoff_s);
             s_backoff_s = (s_backoff_s < NET_RETRY_MAX_S) ? (s_backoff_s * 2u)
                                                           : NET_RETRY_MAX_S;
             continue;
@@ -488,7 +519,7 @@ static void net_thread_fn(void *p1, void *p2, void *p3)
 
                 printk("[NET] join failed, retry in %u s\n",
                        (unsigned)s_backoff_s);
-                k_sleep(K_SECONDS(s_backoff_s));
+                net_pause_s(s_backoff_s);
                 s_backoff_s = (s_backoff_s < NET_RETRY_MAX_S)
                                   ? (s_backoff_s * 2u)
                                   : NET_RETRY_MAX_S;
@@ -500,15 +531,18 @@ static void net_thread_fn(void *p1, void *p2, void *p3)
         publish_net_state(true);
         printk("[NET] online ip=%s\n", s_ip_str);
 
-        while (rw007_wifi_is_connected()) {
-            k_sleep(K_SECONDS(NET_POLL_PERIOD_S));
+        while (rw007_wifi_is_connected() && !s_portal_requested) {
+            net_pause_s(NET_POLL_PERIOD_S);
+        }
+        if (s_portal_requested) {
+            continue;
         }
 
         /* Link lost: take the path down and start the retry cycle. */
         printk("[NET] dropped, retry in %u s\n", (unsigned)s_backoff_s);
         net_take_offline();
         s_joined = false;
-        k_sleep(K_SECONDS(s_backoff_s));
+        net_pause_s(s_backoff_s);
         /* backoff stays at MIN (it was reset when the join succeeded), so
          * the first post-drop retry happens quickly. */
     }
@@ -535,6 +569,11 @@ bool net_task_is_online(void)
 const char *net_task_get_ip(void)
 {
     return s_ip_str;
+}
+
+const char *net_task_get_ssid(void)
+{
+    return (s_have_creds && s_ssid[0] != '\0') ? s_ssid : "None";
 }
 
 void net_task_request_portal(void)

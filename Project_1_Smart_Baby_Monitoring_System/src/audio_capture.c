@@ -506,6 +506,10 @@ static void audio_capture_thread_fn(void *p1, void *p2, void *p3)
             s_rx_underruns++;
         }
 
+        /* Mark this thread's own progress before the feed check: the audio
+         * thread is supervised too, so it must advance its slot each loop
+         * or the feed is withheld and the IWDG resets the board every ~16 s. */
+        watchdog_progress(s_wdt_slot);
         watchdog_feed_check();
 
         /* LED-matrix VU at ~30 Hz (every 4th half-buffer). */

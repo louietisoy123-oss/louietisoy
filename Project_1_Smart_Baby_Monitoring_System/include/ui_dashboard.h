@@ -29,6 +29,14 @@ void ui_dashboard_init(void);
  */
 void ui_dashboard_update(const monitor_state_t *s);
 
+/**
+ * @brief Render the Lab 3 Wi-Fi reconfiguration confirmation dialog on the LCD.
+ *
+ * @param current_ssid  Currently configured SSID (or "None").
+ * @param countdown_sec Seconds remaining before auto-cancel (0 resets cache).
+ */
+void ui_dashboard_show_reset_confirm(const char *current_ssid, int countdown_sec);
+
 #ifdef __cplusplus
 }
 #endif

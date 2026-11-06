@@ -40,10 +40,12 @@ typedef struct {
     char     pass[WIFI_PASS_MAX_LEN];
     char     broker_host[WIFI_BROKER_HOST_MAX_LEN];
     uint16_t broker_port;              /* 0 = no broker saved */
-    uint16_t reserved;                 /* keep checksum word 4-byte aligned  */
+    uint16_t cry_threshold;            /* 10..99, 0 = default 80             */
     uint32_t checksum;
 } wifi_record_t;                       /* 176 bytes, sector 11 is 128 KB     */
 #pragma pack(pop)
+
+static uint8_t s_cry_threshold_cache = 80u;
 
 static uint32_t compute_record_checksum(const wifi_record_t *rec)
 {
@@ -170,6 +172,7 @@ bool wifi_storage_save_ex(const char *ssid, const char *pass,
         strncpy(rec.broker_host, broker_host, WIFI_BROKER_HOST_MAX_LEN - 1);
         rec.broker_port = broker_port;
     }
+    rec.cry_threshold = (uint16_t)s_cry_threshold_cache;
     rec.checksum = compute_record_checksum(&rec);
 
     unsigned int key = irq_lock();
@@ -216,6 +219,22 @@ bool wifi_storage_save(const char *ssid, const char *pass)
 void wifi_storage_clear(void)
 {
     flash_erase_sector_11();
+}
+
+uint8_t wifi_storage_get_cry_threshold(void)
+{
+    const wifi_record_t *rec = (const wifi_record_t *)FLASH_SECTOR_11_BASE;
+    if (record_valid(rec) && rec->cry_threshold >= 10u && rec->cry_threshold <= 99u) {
+        s_cry_threshold_cache = (uint8_t)rec->cry_threshold;
+    }
+    return s_cry_threshold_cache;
+}
+
+void wifi_storage_set_cry_threshold(uint8_t thr)
+{
+    if (thr >= 10u && thr <= 99u) {
+        s_cry_threshold_cache = thr;
+    }
 }
 
 #else
@@ -270,6 +289,20 @@ bool wifi_storage_save(const char *ssid, const char *pass)
 void wifi_storage_clear(void)
 {
     s_sim_valid = false;
+}
+
+static uint8_t s_sim_cry_thr = 80u;
+
+uint8_t wifi_storage_get_cry_threshold(void)
+{
+    return s_sim_cry_thr;
+}
+
+void wifi_storage_set_cry_threshold(uint8_t thr)
+{
+    if (thr >= 10u && thr <= 99u) {
+        s_sim_cry_thr = thr;
+    }
 }
 
 #endif

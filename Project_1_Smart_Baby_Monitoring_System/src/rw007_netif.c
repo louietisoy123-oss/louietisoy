@@ -21,7 +21,11 @@
 #include <string.h>
 
 static struct net_if *s_iface;
+#if defined(__arm__)
+static __attribute__((section(".dtcm_noinit"), aligned(4))) uint8_t s_tx_frame[1520];
+#else
 static uint8_t s_tx_frame[1520];
+#endif
 
 static uint32_t s_rx_frames, s_rx_drop, s_tx_frames, s_tx_fail;
 

@@ -33,6 +33,9 @@ int watchdog_register_thread(const char *name);
 /** Supervised threads call this each loop iteration to mark progress. */
 void watchdog_progress(int slot);
 
+/** Progress mark by registered thread name (for code without the slot index). */
+void watchdog_progress_named(const char *name);
+
 /** Feed point (audio capture thread): feeds the IWDG only if every
  *  registered thread progressed since the previous call. */
 void watchdog_feed_check(void);

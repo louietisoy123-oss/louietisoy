@@ -91,11 +91,18 @@ static const struct device *const gpiog = DEVICE_DT_GET(DT_NODELABEL(gpiog));
 static struct gpio_callback s_int_cb;
 
 /* ---- Driver state ------------------------------------------------------- */
-static struct spi_data_packet s_tx __aligned(4);
-static struct spi_data_packet s_rx __aligned(4);
+/* Placed in DTCM (CPU-only: spi2_xfer is register-polled, no DMA) to free
+ * ~4.5 KB of main SRAM for the Zephyr network packet pools. */
+#if defined(__arm__)
+#define RW_DTCM __attribute__((section(".dtcm_noinit"), aligned(4)))
+#else
+#define RW_DTCM __aligned(4)
+#endif
+static RW_DTCM struct spi_data_packet s_tx;
+static RW_DTCM struct spi_data_packet s_rx;
 static volatile bool s_tx_pending;
 
-static uint8_t  s_resp[SPI_MAX_DATA_LEN] __aligned(4);
+static RW_DTCM uint8_t s_resp[SPI_MAX_DATA_LEN];
 static volatile uint32_t s_wait_cmd = 0xFFFFFFFFU;
 
 static K_SEM_DEFINE(s_int_sem, 0, 1);

@@ -42,7 +42,7 @@
 #include <stdio.h>
 
 #define BLINK_PERIOD_MS      500U
-#define UI_PERIOD_MS         500U
+#define UI_PERIOD_MS         100U
 #define STATUS_PERIOD_MS     1000U
 #define HEARTBEAT_DIVIDER    5U    /* status cycles per console heartbeat (5 s) */
 

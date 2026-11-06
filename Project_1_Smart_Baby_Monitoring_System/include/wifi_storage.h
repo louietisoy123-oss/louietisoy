@@ -74,6 +74,16 @@ bool wifi_storage_save_ex(const char *ssid, const char *pass,
  */
 void wifi_storage_clear(void);
 
+/**
+ * @brief Returns the saved cry status threshold (10..99), or 80 by default.
+ */
+uint8_t wifi_storage_get_cry_threshold(void);
+
+/**
+ * @brief Sets the cry status threshold (10..99) to be persisted on Flash save.
+ */
+void wifi_storage_set_cry_threshold(uint8_t thr);
+
 #ifdef __cplusplus
 }
 #endif

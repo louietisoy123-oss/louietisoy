@@ -42,10 +42,29 @@
 #include "cry_model.h"
 #include "monitor_state.h"
 #include "watchdog.h"
+#include "wifi_storage.h"
 
 /* Confirmation rule (spec): >= 2 of the last 3 consecutive 1 s windows. */
 #define CRY_VOTE_HISTORY  3u
 #define CRY_VOTES_NEEDED  2u
+
+/* Runtime-adjustable cry vote threshold (%, default 80). */
+static volatile uint8_t s_cry_threshold = CRY_CONF_THRESHOLD;
+
+uint8_t cry_task_get_threshold(void)
+{
+	return s_cry_threshold;
+}
+
+void cry_task_set_threshold(uint8_t pct)
+{
+	if (pct < 10u) {
+		pct = 10u;
+	} else if (pct > 99u) {
+		pct = 99u;
+	}
+	s_cry_threshold = pct;
+}
 
 /* ------------------------------------------------------------------- thread */
 static void cry_thread_fn(void *p1, void *p2, void *p3)
@@ -60,6 +79,10 @@ static void cry_thread_fn(void *p1, void *p2, void *p3)
 
 	/* One-time setup: FFT twiddle precompute + scratch buffer claim. */
 	audio_features_init();
+	const uint8_t saved_thr = wifi_storage_get_cry_threshold();
+	if (saved_thr >= 10u && saved_thr <= 99u) {
+		s_cry_threshold = saved_thr;
+	}
 	int16_t *win = audio_capture_scratch_buffer();
 	int wdt_slot = -1;
 	wdt_slot = watchdog_register_thread("cry");
@@ -100,8 +123,9 @@ static void cry_thread_fn(void *p1, void *p2, void *p3)
 		const uint32_t cry_pct = (cls == CRY_PRED_CRY)
 					     ? (uint32_t)conf_pred
 					     : (100u - (uint32_t)conf_pred);
+		const uint8_t thr = s_cry_threshold;
 		const bool positive = (cls == CRY_PRED_CRY) &&
-				      (cry_pct >= CRY_CONF_THRESHOLD);
+				      (cry_pct >= (uint32_t)thr);
 
 		/* 2-of-3 consecutive windows confirmation (hysteresis). */
 		vote_hist[vote_pos] = positive;
@@ -131,9 +155,10 @@ static void cry_thread_fn(void *p1, void *p2, void *p3)
 		 * per-window CRY vote share tells us whether the gate or the
 		 * model is the bottleneck). Downgrade to change-only prints
 		 * once the threshold is tuned. */
-		printk("[CRY] win cls=%s cry%%=%u -> %s\n",
+		printk("[CRY] win cls=%s cry%%=%u thr=%u%% -> %s\n",
 		       (cls == CRY_PRED_CRY) ? "CRY" : "NONCRY",
-		       (unsigned)cry_pct, confirmed ? "ALERT" : "-");
+		       (unsigned)cry_pct, (unsigned)thr,
+		       confirmed ? "ALERT" : "-");
 
 		/* One console line per confirmed-detection CHANGE. */
 		if (confirmed != prev_detected) {
@@ -142,16 +167,20 @@ static void cry_thread_fn(void *p1, void *p2, void *p3)
 			       confirmed ? "YES" : "NO", (unsigned)cry_pct);
 		}
 
-		/* Non-overlapping windows for v1 (see file header): restart
-		 * from a fresh window. Hop/overlap is a tuning option. */
-		filled = 0;
-		watchdog_progress(wdt_slot);
-	}
+			/* Non-overlapping windows for v1 (see file header): restart
+			 * from a fresh window and yield briefly so lower-priority UI,
+			 * status, and socket-service (DHCPv4 server) threads always
+			 * receive CPU even if the ring refilled during compute. */
+			filled = 0;
+			watchdog_progress(wdt_slot);
+			k_sleep(K_MSEC(20));
+		}
 }
 
-/* House style: static thread, no dynamic allocation (prio 7, 4096 stack).
- * CONFIG_THREAD_NAME=y publishes "cry_thread" as the runtime thread name. */
-K_THREAD_DEFINE(cry_thread, 4096, cry_thread_fn, NULL, NULL, NULL, 7, 0, 0);
+/* House style: static thread, no dynamic allocation (prio 12, 4096 stack;
+ * below ui(9)/status(10) so feature extraction never blocks LCD or network
+ * background servicing). CONFIG_THREAD_NAME=y publishes "cry_thread". */
+K_THREAD_DEFINE(cry_thread, 4096, cry_thread_fn, NULL, NULL, NULL, 12, 0, 0);
 
 /* ----------------------------------------------------------------- start hook */
 void cry_task_start(void)

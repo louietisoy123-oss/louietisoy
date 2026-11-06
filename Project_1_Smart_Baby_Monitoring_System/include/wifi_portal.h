@@ -39,6 +39,7 @@ typedef struct {
     char     pass[WIFI_PASS_MAX_LEN];        /* empty = open AP             */
     char     broker_host[WIFI_BROKER_HOST_MAX_LEN]; /* empty = keep previous */
     uint16_t broker_port;                    /* 0 = not provided            */
+    uint8_t  cry_threshold;                  /* 10..99, default 80          */
     bool     valid;                          /* /save submitted and parsed  */
 } wifi_portal_result_t;
 

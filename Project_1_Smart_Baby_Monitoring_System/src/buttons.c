@@ -14,6 +14,8 @@
 #include "net_task.h"
 #include "baby_logic.h"
 #include "monitor_state.h"
+#include "ui_dashboard.h"
+#include "wifi_storage.h"
 
 #include <stdbool.h>
 #include <zephyr/kernel.h>
@@ -96,19 +98,104 @@ static bool key_update(key_t *k, bool raw_now, uint32_t now_ms)
 	return false;
 }
 
+static inline bool key0_raw_pressed(void)
+{
+	return (GPIOC->IDR & (1U << KEY0_BIT)) == 0U;
+}
+
+static inline bool key1_raw_pressed(void)
+{
+	return (GPIOC->IDR & (1U << KEY1_BIT)) == 0U;
+}
+
+/* Lab 3 interactive Wi-Fi reconfiguration dialog: triggered when KEY0 is
+ * pressed while no unmuted alarm is sounding. Shows an 8 s confirmation
+ * screen on the LCD ([KEY0] CONFIRM & RESET / [KEY1] CANCEL & RESUME). */
+static void run_wifi_reconfig_dialog(void)
+{
+	printk("[KEY0] Wi-Fi reconfigure requested. Showing confirmation on LCD...\n");
+	while (key0_raw_pressed()) {
+		k_msleep(10);
+	}
+
+	int countdown = 8;
+	bool confirmed = false;
+	uint32_t t_last = k_uptime_get_32();
+
+	while (countdown > 0) {
+		ui_dashboard_show_reset_confirm(net_task_get_ssid(), countdown);
+
+		if (key0_raw_pressed()) {
+			k_msleep(50);
+			if (key0_raw_pressed()) {
+				confirmed = true;
+				while (key0_raw_pressed()) {
+					k_msleep(10);
+				}
+				break;
+			}
+		}
+
+		if (key1_raw_pressed()) {
+			k_msleep(50);
+			if (key1_raw_pressed()) {
+				printk("[KEY1] Reconfiguration cancelled by user.\n");
+				while (key1_raw_pressed()) {
+					k_msleep(10);
+				}
+				break;
+			}
+		}
+
+		k_msleep(50);
+		if ((k_uptime_get_32() - t_last) >= 1000U) {
+			countdown--;
+			t_last = k_uptime_get_32();
+		}
+	}
+
+	ui_dashboard_show_reset_confirm(NULL, 0);
+
+	if (confirmed) {
+		printk("[WIFI] Reset confirmed by user! Launching Setup Portal...\n");
+		wifi_storage_clear();
+		net_task_request_portal();
+	}
+
+	/* Repaint the main Baby Monitor dashboard frame and reset key state */
+	ui_dashboard_init();
+	s_key0.stable = true;
+	s_key0.last_raw = true;
+	s_key0.held_since_ms = 0U;
+	s_key0.portal_fired = false;
+	s_key1.stable = true;
+	s_key1.last_raw = true;
+}
+
 static void on_key0_press(void)
 {
 	/* Caregiver acknowledge: refresh the logic mute window and mirror it
-	 * into the shared snapshot for the dashboard MUTE row. */
+	 * into the shared snapshot for the dashboard MUTE row. If the buzzer
+	 * was not actively sounding, open the Lab 3 Wi-Fi reconfigure dialog
+	 * so a single KEY0 press lets the user start the BabyMon-Setup hotspot. */
 	uint32_t now = k_uptime_get_32();
+	bool was_ringing;
 
 	monitor_state_lock();
+	was_ringing = monitor_state_get()->buzzer_on ||
+		      monitor_state_get()->test_mode;
 	baby_logic_acknowledge_for(now, ALERT_MUTE_MS);
 	monitor_state_get()->mute_until_ms = now + ALERT_MUTE_MS;
+	monitor_state_get()->buzzer_on =
+		baby_logic_buzzer_on(monitor_state_get()->state, now);
 	monitor_state_unlock();
 
 	printk("[UI] Alert acknowledged (mute %u s)\n",
 	       (unsigned)(ALERT_MUTE_MS / 1000U));
+
+	if (!was_ringing) {
+		run_wifi_reconfig_dialog();
+	}
 }
 
 static void on_key1_press(void)
