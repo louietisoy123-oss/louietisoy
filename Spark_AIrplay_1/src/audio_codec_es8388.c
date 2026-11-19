@@ -314,7 +314,9 @@ static void i2s3_hw_init(void)
 /* -------------------------------------------------------------------------- */
 /* DMA1 Stream 5 & Audio Producer Thread                                      */
 /* -------------------------------------------------------------------------- */
-static K_SEM_DEFINE(s_audio_dma_sem, 2, 2);
+/* Start at 0: the producer must block until the DMA ISR reports the first
+ * half-buffer consumption, not consume two phantom credits at startup. */
+static K_SEM_DEFINE(s_audio_dma_sem, 0, 2);
 
 static void dma1_stream5_isr(const void *arg)
 {

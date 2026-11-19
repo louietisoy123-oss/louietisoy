@@ -10,8 +10,9 @@ static dmap_meta_t s_cur;   // zeroed at load
 static bool upd(char *dst, bool has, const char *src) {
     if (!has) return false;
     if (strcmp(dst, src) == 0) return false;
-    strncpy(dst, src, DMAP_STR_MAX - 1);
-    dst[DMAP_STR_MAX - 1] = '\0';
+    size_t n = strnlen(src, DMAP_STR_MAX - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
     return true;
 }
 

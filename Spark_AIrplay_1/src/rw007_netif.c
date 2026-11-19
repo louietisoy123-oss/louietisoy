@@ -29,8 +29,14 @@ static uint8_t s_tx_frame[1520];
 
 static uint32_t s_rx_frames, s_rx_drop, s_tx_frames, s_tx_fail;
 
+/* Frame hexdump is a boot-time bring-up aid ONLY. Each printk line blocks the
+ * RW007 RX thread for ~6 ms at 115200 baud (UART polling), which during an
+ * AirPlay stream backs up RTP delivery and audibly stutters the audio. */
+#define RW007_NET_DEBUG 0
+
 static void dump_frame(const char *dir, const uint8_t *f, uint16_t len)
 {
+#if RW007_NET_DEBUG
     /* Ignore noisy background multicast (mDNS 01:00:5e:00:00:fb and IGMP) */
     if (f[0] == 0x01 && f[1] == 0x00 && f[2] == 0x5E) {
         return;
@@ -68,6 +74,11 @@ static void dump_frame(const char *dir, const uint8_t *f, uint16_t len)
 
     printk("[NET] %s len=%u dst=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x\n",
            dir, len, f[0], f[1], f[2], f[3], f[4], f[5], f[12], f[13]);
+#else
+    ARG_UNUSED(dir);
+    ARG_UNUSED(f);
+    ARG_UNUSED(len);
+#endif
 }
 
 static void rw007_netif_rx(const uint8_t *frame, uint16_t len)

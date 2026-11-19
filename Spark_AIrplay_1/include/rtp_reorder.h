@@ -29,6 +29,11 @@ typedef struct {
     uint16_t head;                  // highest seq seen + 1 (write head)
     uint16_t count;                 // packets currently buffered
     bool     started;               // false until anchored
+    // Diagnostics (never reset by the buffer itself): why audio went missing.
+    uint32_t stat_ffwd;             // window-overflow fast-forwards
+    uint32_t stat_skipped;          // packets jumped over by those fast-forwards
+    uint32_t stat_old;              // inserts dropped as already played/concealed
+    uint32_t stat_dup;              // inserts dropped as duplicates
 } rtp_reorder_t;
 
 typedef enum {

@@ -70,24 +70,22 @@ An embedded **AirPlay 1 (RAOP)** wireless audio receiver engineered for the **RT
 
 | Subsystem | Signal | STM32F407 Pin | Description |
 |---|---|---|---|
-| **RW007 Wi-Fi** | SPI2 SCK | `PB13` | SPI Clock |
+| **RW007 Wi-Fi** | SPI2 SCK | `PB13` | SPI Clock (10.5 MHz, mode 0) |
 | | SPI2 MISO | `PC2` | Master In / Slave Out |
 | | SPI2 MOSI | `PC3` | Master Out / Slave In |
-| | SPI2 CS | `PG15` | Slave Select (Active Low) |
-| | RW007 INT | `PF10` | Interrupt / Data Ready |
-| | RW007 RST | `PG11` | Hardware Reset |
+| | RW007 CS | `PF10` | Slave Select (Active Low) |
+| | RW007 RST | `PG15` | Hardware Reset |
+| | RW007 INT/BUSY | `PG11` | Falling edge = module needs service |
 | **ES8388 Audio** | I2S3 WS (LRCK) | `PA15` | Word Select (Left/Right Clock) |
 | | I2S3 CK (BCLK) | `PB3` | Bit Clock |
 | | I2S3 SD (DIN) | `PB5` | Serial Data Out (to ES8388 DAC) |
 | | I2S3 MCK | `PC7` | Master Clock |
-| | I2C1 SCL | `PB6` | Codec Configuration Clock |
-| | I2C1 SDA | `PB7` | Codec Configuration Data |
-| **ST7789 LCD** | LCD D0..D15 | `PD14,15,0,1, PE7..15` | FSMC 16-bit Parallel Data Bus |
-| | LCD RS / CS | `PD11 / PD7` | Register Select / Chip Select |
-| | LCD WR / RD | `PD5 / PD4` | Write Enable / Read Enable |
-| | LCD RST / BL | `PD12 / PB15` | Reset / Backlight PWM |
-| **RGB LED** | SK6805 DIN | `PA8` | 19-LED RGB Visualizer Data |
-| **Buttons** | D-Pad / Keys | `PA0, PC13, PB10..11` | 5-way navigation & playback control |
+| | I2C SCL / SDA | `PF1 / PF0` | Bit-banged codec control (address 0x10) |
+| **ST7789 LCD** | FSMC D0..D7 | `PD14, PD15, PD0, PD1, PE7..PE10` | FSMC Bank 1 NE3, 8-bit 8080 bus |
+| | DCX / RD / WR | `PD13 (A18) / PD4 / PD5` | Data-command select / read / write strobes |
+| | RST / BL | `PD3 / PF9` | Reset / Backlight |
+| **RGB LED** | SK6805 DIN | `PF2` | 19-LED RGB visualizer data |
+| **Buttons** | D-Pad | `PC5 up, PC1 down, PC0 left, PC4 right, PA0 centre` | Active low |
 
 ---
 
@@ -96,10 +94,34 @@ An embedded **AirPlay 1 (RAOP)** wireless audio receiver engineered for the **RT
 - **Operating System**: Zephyr RTOS v4.4.0 (L2 Ethernet, BSD Sockets, IGMP, Multicast DNS).
 - **Crypto Suite**: Vendored standalone mbedTLS 3.6 cryptographic primitives (`aes`, `rsa`, `bignum`, `sha1`, `md`, `asn1parse`, `pkparse`) compiled directly into `src/crypto/` to eliminate TF-PSA-Crypto conflicts.
 - **DTCM Placement (64 KB @ 0x10000000)**:
-  - 16-bit stereo PCM circular DMA audio ring buffer (`s_pcm_ring`).
+  - 16-bit stereo PCM audio ring buffer (`s_pcm_ring`, 3840 frames = ~87 ms) — the streaming jitter buffer; the RTP path backpressures into it (retry-on-full, never drops mid-stream).
   - RW007 SPI high-speed frame transfer buffers (`s_tx_frame`, `s_rx_frame`).
+  - mbedTLS crypto heap (11 KB, used only during the RTSP handshake: RSA key parse / challenge sign / OAEP decrypt — sized against on-hardware evidence; 8 KB OOM'd during OAEP).
+  - ALAC decode state buffers.
 - **Internal SRAM (128 KB)**:
-  - Zephyr kernel threads, networking buffers, RTP reorder window (12 packets, ~18 KB), and ALAC decoding state buffers.
+  - Zephyr kernel threads and networking buffers (22 RX packets / 42 RX net_bufs ≈ 160 ms of burst headroom).
+  - RTP reorder window lives in DTCM: 8 packets (~64 ms) with 4-packet (32 ms) hold before silence concealment.
+
+---
+
+## 4b. Testing the Receiver (Python test sender)
+
+`tools/send_test_audio.py` is a full AirPlay 1 sender-side test rig (Python 3, `pip install cryptography pyserial`):
+
+```bash
+cd Spark_AIrplay_1/tools
+
+python send_test_audio.py                      # 10 s chord-arp tone, auto-discover the board
+python send_test_audio.py --pc                 # stream this PC's live audio output (WASAPI loopback)
+python send_test_audio.py --wave ../../tmp/lukaluka_44100.wav --duration 40
+python send_test_audio.py --ip 192.168.1.56 --serial COM7 --volume-db -10
+python send_test_audio.py --list-ports         # COM ports | --list-pc-devices: loopback devices
+```
+
+- **Discovery order**: `--ip` > SoftAP heuristic (192.168.4.x) > ARP cache > one-shot mDNS (`_raop._tcp`) > serial boot log > concurrent /24 scan. The verified RTSP connection is adopted, not re-opened (the server is single-client).
+- **WAV mode** requires 44.1 kHz / 16-bit / stereo: `ffmpeg -i in.wav -ar 44100 -ac 2 -sample_fmt s16 out.wav`.
+- **`--pc` mode** captures whatever the PC is playing (WASAPI loopback, `pip install soundcard numpy`), rate-converts it to 44.1 kHz, and pads the send timeline with silence to the wall clock — so the board's jitter buffer never runs dry; content gaps play as silence.
+- The script services the board's 0xD5 resend requests and answers 0xD2 timing requests, paces RTP at real time with sub-millisecond drift, and prints the board's health telemetry (`[RT-Spark] health: underruns/ring_stalls/conceals/resends/dma_misses/decode_*`).
 
 ---
 
@@ -175,3 +197,22 @@ If the Captive Portal times out without any submission and no router credentials
   - Middle: Track title and artist parsed from DMAP metadata.
   - Bottom: Real-time dual-channel (Left / Right) peak VU meters.
 - **Visualizer**: 19-LED SK6805 RGB ring mirrors the audio signal dynamics.
+
+---
+
+## 8. Stutter Investigation & Known Limitation
+
+Playback works, but long streams still drop out. These are the findings from the stutter investigation.
+
+**Ruled out on hardware (board side is not the bottleneck):**
+- **CPU / RAM:** with the board's own test sender, the audio pipeline runs with `underruns=0` and `dma_misses=0` whenever packets actually arrive. Decode and I2S keep up easily.
+- **Rendering:** the LCD was blocking the audio thread. The UI thread now runs at priority 10, redraws only what changed, and skips LED frames while audio is under pressure.
+- **Buffering:** the jitter path was rebuilt. The RTP path now backpressures into the ring instead of dropping. The PCM ring holds 3840 frames (~87 ms), 7 packets (~56 ms) are buffered before playback starts, and the reorder window is 8 packets with a 4-packet hold. Net RX buffers went to 22 packets / 42 bufs.
+- **Wi-Fi power save:** the RW007 power-save mode is read, disabled and read back after DHCP. It already reports 0.
+- **Signal / router:** RSSI is sampled and logged, and the drops also happen on a laptop hotspot one metre away.
+
+**Root cause:** after about 10–35 s of continuous streaming, the **RW007 stops delivering unicast frames** to the STM32. There is no DISCONNECT event, the SPI handshake stays healthy, and the RSSI is fine. The stall is inside the RW007 module firmware, which is a closed binary.
+
+**Mitigation in firmware:** a stall watchdog in `main.c` rejoins the network if no audio arrives for 5 s while recording (`STALL_REJOIN_MS`), at most 3 times in a row, at least 15 s apart. It has only been exercised with a simulated stall so far.
+
+The USB path doesn't depend on the RW007. For glitch-free PC playback on this board, use [`../Spark_USB_DAC`](../Spark_USB_DAC).

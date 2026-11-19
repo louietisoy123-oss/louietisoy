@@ -237,6 +237,9 @@ static bool dispatch(int fd, const rtsp_request_t *req) {
     } else if (strcmp(req->method, "FLUSH") == 0 ||
                strcmp(req->method, "PAUSE") == 0 ||
                strcmp(req->method, "GET_PARAMETER") == 0) {
+        if (req->method[0] != 'G') {
+            raop_rtp_note_flush();   /* FLUSH/PAUSE: silence is expected, not a stall */
+        }
         send_response(fd, 200, "OK", cseq, NULL, NULL, 0);
     } else if (strcmp(req->method, "TEARDOWN") == 0) {
         send_response(fd, 200, "OK", cseq, NULL, NULL, 0);

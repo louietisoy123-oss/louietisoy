@@ -16,6 +16,10 @@ void audio_airplay_set_volume(float db);
 void audio_diag_tone_stop(void);
 void audio_diag_tone_start(void);
 
+/* Live stream-health counters: output-side starvation (underruns) and the
+ * I2S DMA refill misses (dma_misses) from the codec driver diagnostics. */
+void audio_get_stream_health(uint32_t *underruns, uint32_t *dma_misses);
+
 #ifdef __cplusplus
 }
 #endif

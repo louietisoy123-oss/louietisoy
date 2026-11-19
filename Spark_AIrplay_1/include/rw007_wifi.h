@@ -82,6 +82,48 @@ void rw007_wifi_set_rx_callback(rw007_rx_cb_t cb);
  */
 bool rw007_wifi_send_frame(const uint8_t *frame, uint16_t len);
 
+/**
+ * @brief Driver diagnostics for stream-health telemetry.
+ * @param wake_timeouts times the 1000 ms poll fired with no INT wake (INT missed or idle)
+ * @param xfers         completed two-stage SPI transfers
+ * @param xfer_errs     failed transfers
+ */
+void rw007_wifi_get_diag(uint32_t *wake_timeouts, uint32_t *xfers, uint32_t *xfer_errs);
+
+/** Times the safety-net poll (not an INT edge) discovered data waiting in the module.
+ *  Non-zero means INT wake-ups are being lost; each one is a latency spike. */
+uint32_t rw007_wifi_get_poll_found(void);
+
+/**
+ * @brief Handshake diagnostics: INT edges seen, stage-1 INT waits that timed out,
+ *        transfers where we had TX data but the chip did not report SRDY, and the
+ *        longest single transfer (the transfer lock is held for its whole duration).
+ */
+void rw007_wifi_get_link_diag(uint32_t *int_edges, uint32_t *int_wait_to,
+                              uint32_t *srdy_clear, uint32_t *xfer_max_ms);
+
+/**
+ * @brief Receive-side breakdown: how often the chip had data, how much of it was
+ *        forwarded as ethernet frames versus ignored, and the type/length of the
+ *        last ignored item. Used to tell "chip delivers nothing" from "driver drops it".
+ */
+void rw007_wifi_get_rx_diag(uint32_t *s2m_nonzero, uint32_t *eth, uint32_t *other,
+                            uint32_t *cont, uint32_t *other_type, uint32_t *other_len);
+
+/**
+ * @brief Module power-save control (RW00x_CMD_GET/SET_PWR_SAVE, 15/14).
+ *        The value encoding is undocumented; both calls log the raw reply.
+ * @return module result code (0 = ok), negative on transport timeout.
+ */
+int rw007_wifi_power_save_get(int32_t *value);
+int rw007_wifi_power_save_set(int32_t value);
+
+/** Leave the current access point (RW00x_CMD_DISCONNECT). Used before a rejoin. */
+bool rw007_wifi_disconnect(void);
+
+/** Current RSSI in dBm as reported by the module (RW00x_CMD_GET_RSSI, 13). 0 on success. */
+int rw007_wifi_get_rssi(int32_t *rssi);
+
 /** Station MAC address read from the module. */
 void rw007_wifi_get_mac(uint8_t mac[6]);
 

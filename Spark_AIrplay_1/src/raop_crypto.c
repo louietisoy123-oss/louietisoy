@@ -11,8 +11,16 @@
 #include <stdlib.h>
 
 /* Dedicated crypto heap placed in 64 KB DTCM (0x10000000).
- * Prevents libc malloc / sbrk out-of-memory during RSA 2048 key parsing and crypto operations. */
-static uint8_t s_crypto_heap_mem[14336] __attribute__((section(".dtcm_noinit")));
+ * Prevents libc malloc / sbrk out-of-memory during RSA 2048 key parsing and crypto operations.
+ *
+ * Sized by on-hardware evidence: an 8 KB heap OOM'd during OAEP decrypt
+ * ("sys_heap_alloc failed" while the RSA private path held CRT + blinding
+ * MPIs), while the original 14 KB was generous. 11 KB gives ~40% headroom
+ * over the observed peak; the freed 3 KB was reallocated to the streaming
+ * PCM ring in main.c (DTCM budget neutral). The per-packet AES-CBC path uses
+ * a static mbedtls_aes_context and never touches this heap — it is idle for
+ * the whole stream. */
+static uint8_t s_crypto_heap_mem[11264] __attribute__((section(".dtcm_noinit")));
 static struct sys_heap s_crypto_heap;
 static bool s_crypto_heap_inited = false;
 static K_MUTEX_DEFINE(s_crypto_heap_mutex);

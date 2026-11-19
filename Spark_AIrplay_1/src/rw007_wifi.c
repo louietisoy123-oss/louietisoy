@@ -57,6 +57,11 @@
 #define CMD_DISCONNECT  9
 #define CMD_AP_STOP     10
 #define CMD_AP_MAC_GET  22
+/* Numbers from RT-Thread's rw007 package (inc/spi_wifi_rw007.h, RW00x_CMD enum).
+ * Parameter encoding is NOT documented there; the calls below log raw replies. */
+#define CMD_GET_RSSI       13
+#define CMD_SET_PWR_SAVE   14
+#define CMD_GET_PWR_SAVE   15
 
 #define EVT_CONNECT         1
 #define EVT_CONNECT_FAIL    2
@@ -130,6 +135,69 @@ static volatile bool s_ap_mode;
 static uint8_t s_ap_mac[6];
 static rw007_rx_cb_t s_rx_cb;
 
+/* SPI2 baud divider field (CR1.BR): 0 = /2 = 21 MHz, 1 = /4 = 10.5 MHz.
+ * 21 MHz was tried once on the laptop hotspot: no gain, SPI errors rose from 52
+ * to 184 (single run each, PC-side stalls differed, so inconclusive). Kept at the
+ * known-good 10.5 MHz. */
+#define RW007_SPI_BR 1U
+
+/* Safety-net poll interval for the driver thread (see rw007_thread).
+ * 1000 ms is the known-good value. 10 ms was tried and coincided with an RTSP
+ * ANNOUNCE reply taking >10 s; the suspected cause (each poll holds s_xfer_lock
+ * for up to 100 ms waiting on INT, starving the TX path) is unproven. Keep this
+ * at 1000 until s_diag_poll_found shows lost INT wake-ups actually occur. */
+#define RW007_POLL_MS 1000
+
+/* Driver diagnostics, read by the RTP health print */
+static volatile uint32_t s_diag_poll_found;     /* data that only the poll (not an INT edge) found */
+static volatile uint32_t s_diag_wake_timeouts;  /* poll fired with no INT wake */
+static volatile uint32_t s_diag_int_edges;      /* INT falling edges seen by the ISR */
+static volatile uint32_t s_diag_int_wait_to;    /* stage-1 "ready for stage 2" INT never came (100 ms) */
+static volatile uint32_t s_diag_srdy_clear;     /* we had TX data but chip did not report SRDY */
+static volatile uint32_t s_diag_xfer_max_ms;    /* longest single transfer, lock held throughout */
+static volatile uint32_t s_diag_xfers;          /* completed two-stage transfers */
+static volatile uint32_t s_diag_xfer_errs;      /* failed transfers */
+
+/* What the chip actually handed us, by outcome (see rw007_wifi_get_rx_diag) */
+static volatile uint32_t s_diag_s2m_nonzero;    /* transfers where the chip had data for us */
+static volatile uint32_t s_diag_rx_eth;         /* ethernet frames forwarded to the stack */
+static volatile uint32_t s_diag_rx_other;       /* data we received but did not forward */
+static volatile uint32_t s_diag_continue;       /* transfers that asked for an immediate repeat */
+static volatile uint32_t s_diag_last_other_type;
+static volatile uint32_t s_diag_last_other_len;
+
+uint32_t rw007_wifi_get_poll_found(void)
+{
+    return s_diag_poll_found;
+}
+
+void rw007_wifi_get_link_diag(uint32_t *int_edges, uint32_t *int_wait_to,
+                              uint32_t *srdy_clear, uint32_t *xfer_max_ms)
+{
+    if (int_edges)    *int_edges    = s_diag_int_edges;
+    if (int_wait_to)  *int_wait_to  = s_diag_int_wait_to;
+    if (srdy_clear)   *srdy_clear   = s_diag_srdy_clear;
+    if (xfer_max_ms)  *xfer_max_ms  = s_diag_xfer_max_ms;
+}
+
+void rw007_wifi_get_diag(uint32_t *wake_timeouts, uint32_t *xfers, uint32_t *xfer_errs)
+{
+    if (wake_timeouts) *wake_timeouts = s_diag_wake_timeouts;
+    if (xfers)         *xfers         = s_diag_xfers;
+    if (xfer_errs)     *xfer_errs     = s_diag_xfer_errs;
+}
+
+void rw007_wifi_get_rx_diag(uint32_t *s2m_nonzero, uint32_t *eth, uint32_t *other,
+                            uint32_t *cont, uint32_t *other_type, uint32_t *other_len)
+{
+    if (s2m_nonzero) *s2m_nonzero = s_diag_s2m_nonzero;
+    if (eth)         *eth         = s_diag_rx_eth;
+    if (other)       *other       = s_diag_rx_other;
+    if (cont)        *cont        = s_diag_continue;
+    if (other_type)  *other_type  = s_diag_last_other_type;
+    if (other_len)   *other_len   = s_diag_last_other_len;
+}
+
 /* Takes s_xfer_lock and returns true once the single TX slot is free. */
 static bool tx_slot_take(int timeout_ms)
 {
@@ -177,8 +245,9 @@ static void spi2_hw_init(void)
     GPIOC->OSPEEDR |= (3U << 4) | (3U << 6);
     GPIOC->AFR[0] = (GPIOC->AFR[0] & ~((0xFU << 8) | (0xFU << 12))) | ((5U << 8) | (5U << 12));
 
-    /* Master, software NSS, mode 0, fPCLK1/4 = 10.5 MHz (RW007 supports up to 30 MHz) */
-    SPI2->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | (1U << 3);
+    /* Master, software NSS, mode 0. SPI2 sits on APB1 = 42 MHz here (168 MHz / 4),
+     * so the BR divider gives: 0 -> 21 MHz, 1 -> 10.5 MHz, 2 -> 5.25 MHz. */
+    SPI2->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | (RW007_SPI_BR << 3);
     SPI2->CR1 |= SPI_CR1_SPE;
 }
 
@@ -200,6 +269,7 @@ static inline void cs_release(void) { gpio_pin_set_raw(gpiof, PIN_CS, 1); }
 
 static void int_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
+    s_diag_int_edges++;
     k_sem_give(&s_int_sem);
     k_sem_give(&s_wake_sem);
 }
@@ -301,7 +371,12 @@ static void handle_rx(const struct spi_data_packet *p)
     }
     else if ((p->data_type == DATA_TYPE_STA_ETH || p->data_type == DATA_TYPE_AP_ETH) &&
              p->data_len >= 14 && p->data_len <= SPI_MAX_DATA_LEN && s_rx_cb) {
+        s_diag_rx_eth++;
         s_rx_cb(p->buffer, (uint16_t)p->data_len);
+    } else {
+        s_diag_rx_other++;        /* data the chip sent that we did not forward */
+        s_diag_last_other_type = p->data_type;
+        s_diag_last_other_len  = p->data_len;
     }
 }
 
@@ -331,7 +406,9 @@ static int rw007_transfer(uint16_t seq)
     }
 
     /* The slave pulses INT when it is ready for stage 2 */
-    (void)k_sem_take(&s_int_sem, K_MSEC(100));
+    if (k_sem_take(&s_int_sem, K_MSEC(100)) != 0) {
+        s_diag_int_wait_to++;
+    }
 
     /* Stage 2: data header + payload */
     build_req(req, MASTER_FLAG_MRDY, PHASE_MASTER_DATA, seq, m2s);
@@ -346,6 +423,11 @@ static int rw007_transfer(uint16_t seq)
 
     uint16_t s2m = (uint16_t)(rsp[6] | (rsp[7] << 8));
     uint16_t tx_slave_buf = rsp[2] >> 4;
+    /* build_req() packs flag in the low nibble of byte 1; SRDY is bit 0
+     * (SLAVE_FLAG_SRDY = 0x01 in the vendor header). */
+    if (have_tx && !(rsp[1] & 0x01)) {
+        s_diag_srdy_clear++;
+    }
     uint32_t max_len = m2s;
 
     if (s2m > MAX_SPI_PACKET_SIZE) {
@@ -366,7 +448,11 @@ static int rw007_transfer(uint16_t seq)
     }
 
     if (s2m > 0) {
+        s_diag_s2m_nonzero++;
         handle_rx(&s_rx);
+    }
+    if (tx_slave_buf > 0) {
+        s_diag_continue++;
     }
     return tx_slave_buf > 0 ? XFER_CONTINUE : XFER_OK;
 }
@@ -377,14 +463,32 @@ static void rw007_thread(void *a, void *b, void *c)
     int errors = 0;
 
     for (;;) {
-        (void)k_sem_take(&s_wake_sem, K_MSEC(1000));
+        /* Poll fallback. The INT edge is the normal wake. The end-of-loop
+         * k_sem_reset() below could swallow a genuine new edge that lands in
+         * the same window (a lost wake-up), leaving frames queued in the module
+         * until this timeout fires. Whether that actually happens is what
+         * s_diag_poll_found measures: it counts data that only the poll found. */
+        bool polled = (k_sem_take(&s_wake_sem, K_MSEC(RW007_POLL_MS)) != 0);
+        uint32_t has_data_before = s_diag_s2m_nonzero;
+        if (polled) {
+            s_diag_wake_timeouts++;
+        }
         int r;
         do {
             seq = (seq >= 65533) ? 1 : (seq + 1);
             k_mutex_lock(&s_xfer_lock, K_FOREVER);
+            uint32_t t_xfer = k_uptime_get_32();
             r = rw007_transfer(seq);
+            uint32_t d_xfer = k_uptime_get_32() - t_xfer;
+            if (d_xfer > s_diag_xfer_max_ms) {
+                s_diag_xfer_max_ms = d_xfer;
+            }
             k_mutex_unlock(&s_xfer_lock);
+            if (r != XFER_ERR) {
+                s_diag_xfers++;
+            }
             if (r == XFER_ERR) {
+                s_diag_xfer_errs++;
                 if (++errors % 20 == 1) {
                     printk("[RW007] SPI transfer error (count %d)\n", errors);
                 }
@@ -392,6 +496,9 @@ static void rw007_thread(void *a, void *b, void *c)
                 break;
             }
         } while (r == XFER_CONTINUE || s_tx_pending);
+        if (polled && s_diag_s2m_nonzero != has_data_before) {
+            s_diag_poll_found++;      /* the poll, not an INT edge, found this data */
+        }
         k_sem_reset(&s_wake_sem);
     }
 }
@@ -545,6 +652,48 @@ int rw007_wifi_get_scan_aps(rw007_ap_entry_t *out_aps, int max_count)
     int n = (s_scan_ap_count < max_count) ? s_scan_ap_count : max_count;
     memcpy(out_aps, s_scan_aps, n * sizeof(rw007_ap_entry_t));
     return n;
+}
+
+/* Query helpers. Replies are logged raw because the chip's encoding for these
+ * commands is undocumented: rc is the module result code, data is the payload. */
+int rw007_wifi_power_save_get(int32_t *value)
+{
+    uint8_t out[8] = {0};
+    uint32_t n = 0;
+    int rc = rw007_cmd(CMD_GET_PWR_SAVE, NULL, 0, out, sizeof(out), &n, 2000);
+    int32_t v = (n >= 4) ? (int32_t)get32(out) : -1;
+    printk("[RW007] GET_PWR_SAVE rc=%d len=%u data=%02x %02x %02x %02x (=%d)\n",
+           rc, (unsigned)n, out[0], out[1], out[2], out[3], (int)v);
+    if (value) *value = v;
+    return rc;
+}
+
+int rw007_wifi_power_save_set(int32_t value)
+{
+    uint8_t p[4];
+    put32(p, (uint32_t)value);
+    int rc = rw007_cmd(CMD_SET_PWR_SAVE, p, sizeof(p), NULL, 0, NULL, 2000);
+    printk("[RW007] SET_PWR_SAVE(%d) rc=%d\n", (int)value, rc);
+    return rc;
+}
+
+bool rw007_wifi_disconnect(void)
+{
+    if (!s_initialized) return false;
+    int rc = rw007_cmd(CMD_DISCONNECT, NULL, 0, NULL, 0, NULL, 5000);
+    printk("[RW007] CMD_DISCONNECT -> %d\n", rc);
+    s_connected = false;
+    return rc == 0;
+}
+
+int rw007_wifi_get_rssi(int32_t *rssi)
+{
+    uint8_t out[8] = {0};
+    uint32_t n = 0;
+    int rc = rw007_cmd(CMD_GET_RSSI, NULL, 0, out, sizeof(out), &n, 2000);
+    int32_t v = (n >= 4) ? (int32_t)get32(out) : 0;
+    if (rssi) *rssi = v;
+    return (rc == 0 && n >= 4) ? 0 : -1;
 }
 
 bool rw007_wifi_connect(const char *ssid, const char *password)

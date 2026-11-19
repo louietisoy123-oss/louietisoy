@@ -9,6 +9,7 @@ void rtp_reorder_init(rtp_reorder_t *rb, rtp_reorder_slot_t *slots,
     rb->slots = slots; rb->window = window;
     rb->hold = (hold && hold < window) ? hold : (uint16_t)(window - 1);
     rb->next = rb->head = rb->count = 0; rb->started = false;
+    rb->stat_ffwd = rb->stat_skipped = rb->stat_old = rb->stat_dup = 0;
     for (uint16_t i = 0; i < window; i++) slots[i].valid = false;
 }
 void rtp_reorder_anchor(rtp_reorder_t *rb, uint16_t first_seq){
@@ -19,15 +20,19 @@ rtp_ins_t rtp_reorder_insert(rtp_reorder_t *rb, uint16_t seq,
                              const uint8_t *data, size_t len){
     if (len == 0 || len > RTP_REORDER_MAX_PKT) return RTP_INS_BADLEN;
     if (!rb->started){ rb->next = rb->head = seq; rb->started = true; }
-    if (seq_lt(seq, rb->next)) return RTP_INS_TOO_OLD;      // already past it
+    if (seq_lt(seq, rb->next)) { rb->stat_old++; return RTP_INS_TOO_OLD; }  // already past it
     if (seq_diff(seq, rb->next) >= rb->window) {
-        // Fast-forward cursor on large gap / burst overflow instead of dropping future packets
+        // Fast-forward cursor on large gap / burst overflow instead of dropping future packets.
+        // This DISCARDS every buffered-but-unplayed packet and skips the ones in between,
+        // so it is counted: callers should drain between inserts to keep it from firing.
+        rb->stat_ffwd++;
+        rb->stat_skipped += seq_diff(seq, rb->next);
         rb->next = seq;
         for (uint16_t i = 0; i < rb->window; i++) rb->slots[i].valid = false;
         rb->count = 0;
     }
     rtp_reorder_slot_t *sl = &rb->slots[seq % rb->window];
-    if (sl->valid && sl->seq == seq) return RTP_INS_DUP;    // retransmit we already hold
+    if (sl->valid && sl->seq == seq) { rb->stat_dup++; return RTP_INS_DUP; }  // retransmit we already hold
     if (!sl->valid) rb->count++;
     sl->valid = true; sl->seq = seq; sl->len = (uint16_t)len;
     memcpy(sl->data, data, len);

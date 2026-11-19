@@ -38,3 +38,12 @@ int  raop_rtp_start(raop_session_t *s);
 // if the task is not running. Returns true if a running stream was actually stopped
 // (so the caller knows to resume the pre-stream producer), false otherwise.
 bool raop_rtp_stop(void);
+
+// Watchdog support. Milliseconds since the last audio datagram arrived (or since
+// the stream started, if none has yet), or 0 when no stream is running or the
+// sender has paused/flushed on purpose. Safe to call from any thread.
+uint32_t raop_rtp_stalled_ms(void);
+
+// Tell the RTP side the sender paused (RTSP FLUSH/PAUSE), so silence is expected.
+// Cleared automatically when the next audio datagram arrives.
+void raop_rtp_note_flush(void);

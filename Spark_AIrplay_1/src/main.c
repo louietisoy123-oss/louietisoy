@@ -52,7 +52,13 @@ static void ip_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 #define CONFIG_WIFI_PASS        ""
 
 #define DEFAULT_VOLUME          80
-#define PCM_RING_FRAMES         (3072U)
+/* 3840 stereo frames = 87 ms of 44.1 kHz output. The ring is THE jitter
+ * buffer on the F407 (no PSRAM like the ESP32 reference: it carries ~4 s);
+ * feed_pcm() backpressures into it instead of dropping, so every byte of it
+ * absorbs Wi-Fi bursts. 3 KB were reclaimed for this from the handshake-only
+ * RSA crypto heap (raop_crypto.c) — sized against on-hardware evidence so the
+ * OAEP handshake keeps ~40% heap headroom. DTCM budget unchanged. */
+#define PCM_RING_FRAMES         (3840U)
 #define PCM_RING_SAMPLES        (PCM_RING_FRAMES * 2U)
 
 /* Audio Ring Buffer in DTCM RAM for 0-wait-state access */
@@ -66,12 +72,15 @@ static volatile uint32_t s_pcm_head = 0;
 static volatile uint32_t s_pcm_tail = 0;
 static struct k_spinlock s_ring_lock;
 static volatile bool s_primed = false;
-#define PCM_PRIME_THRESHOLD     (352U * 2U * 4U) /* ~4 packets (32 ms) pre-buffering */
+#define PCM_PRIME_THRESHOLD     (352U * 2U * 7U) /* ~56 ms pre-buffering before playback starts */
 
 static volatile int16_t s_peak_l = 0;
 static volatile int16_t s_peak_r = 0;
 static volatile uint8_t s_volume = DEFAULT_VOLUME;
 static volatile bool s_is_streaming = false;
+
+/* Stream-health counters (telemetry: distinguish buffer starvation from CPU overload) */
+static volatile uint32_t s_underruns = 0;   /* drain callback hit an empty ring */
 
 static char s_track_title[64]  = "Ready for AirPlay";
 static char s_track_artist[64] = "Connect iPhone/Mac";
@@ -92,6 +101,7 @@ bool audio_producer_acquire(const char *name)
     memset(s_pcm_ring, 0, sizeof(s_pcm_ring));
     k_spin_unlock(&s_ring_lock, key);
     s_is_streaming = true;
+    s_underruns = 0;
     printk("[Audio] Producer acquired: streaming active\n");
     return true;
 }
@@ -108,6 +118,9 @@ void audio_producer_release(void)
     printk("[Audio] Producer released: streaming stopped\n");
 }
 
+/* Backpressured producer API (mirrors the ESP32 reference): accepts as many
+ * whole stereo frames as currently fit and returns that count — NEVER drops
+ * unplayed audio to make room. Callers retry until the ring drains. */
 size_t audio_play_pcm(const int16_t *pcm, size_t frames)
 {
     if (pcm == NULL || frames == 0) return 0;
@@ -120,14 +133,13 @@ size_t audio_play_pcm(const int16_t *pcm, size_t frames)
                             (s_pcm_tail - s_pcm_head - 1U) :
                             (PCM_RING_SAMPLES - s_pcm_head + s_pcm_tail - 1U);
 
-    if (samples > free_samples) {
-        /* Discard only the oldest stereo frames necessary to fit new data */
-        uint32_t discard = samples - free_samples;
-        discard = (discard + 1U) & ~1U; /* Keep stereo L/R phase aligned */
-        s_pcm_tail = (s_pcm_tail + discard) % PCM_RING_SAMPLES;
+    size_t take = samples;
+    if (take > free_samples) {
+        take = free_samples;
     }
+    take &= ~1U; /* whole stereo frames only: keep L/R phase aligned */
 
-    for (size_t i = 0; i < samples; i++) {
+    for (size_t i = 0; i < take; i++) {
         s_pcm_ring[s_pcm_head] = pcm[i];
         s_pcm_head = (s_pcm_head + 1U) % PCM_RING_SAMPLES;
     }
@@ -140,7 +152,7 @@ size_t audio_play_pcm(const int16_t *pcm, size_t frames)
     }
     k_spin_unlock(&s_ring_lock, key);
 
-    return frames;
+    return take / 2U;
 }
 
 void audio_airplay_set_volume(float db)
@@ -164,6 +176,12 @@ void audio_airplay_set_volume(float db)
 
 void audio_diag_tone_stop(void) {}
 void audio_diag_tone_start(void) {}
+
+void audio_get_stream_health(uint32_t *underruns, uint32_t *dma_misses)
+{
+    if (underruns)  *underruns  = s_underruns;
+    if (dma_misses) *dma_misses = audio_get_diagnostics()->dma_misses;
+}
 
 /* DMA Hardware Drain Callback from ES8388 driver */
 static void audio_pcm_drain_callback(int16_t *buf, size_t samples)
@@ -193,6 +211,9 @@ static void audio_pcm_drain_callback(int16_t *buf, size_t samples)
             r = s_pcm_ring[s_pcm_tail];
             s_pcm_tail = (s_pcm_tail + 1U) % PCM_RING_SAMPLES;
             avail -= 2;
+        } else {
+            /* Ring ran dry mid-block: real-time output starved by the source */
+            s_underruns++;
         }
 
         buf[i]     = l;
@@ -225,46 +246,82 @@ void airplay_notify_metadata(const char *title, const char *artist, const char *
 /* -------------------------------------------------------------------------- */
 /* Display UI Renderer                                                        */
 /* -------------------------------------------------------------------------- */
+/* The FSMC full-screen repaint costs ~6 ms; only pay it when the static UI
+ * actually changes. Between changes, refresh just the two VU bars (~400 px). */
+static bool     s_ui_full_repaint   = true;
+static bool     s_ui_last_streaming = false;
+static uint8_t  s_ui_last_volume    = 0xFF;
+static char     s_ui_last_title[64]  = "";
+static char     s_ui_last_artist[64] = "";
+
+static void render_vu_bar(uint16_t y, uint16_t new_v)
+{
+    uint16_t color = (new_v > 170) ? LCD_COLOR_RED
+                   : ((new_v > 120) ? LCD_COLOR_YELLOW : LCD_COLOR_GREEN);
+
+    lcd_fill_rect(25, y, 225, y + 8, LCD_COLOR_BLACK); /* clear bar track */
+    if (new_v > 0) {
+        lcd_fill_rect(25, y, 25 + new_v, y + 8, color);
+    }
+}
+
 static void render_ui(void)
 {
-    char line[40];
+    bool streaming = s_is_streaming;
+    bool changed = s_ui_full_repaint ||
+                   (streaming != s_ui_last_streaming) ||
+                   (s_volume != s_ui_last_volume) ||
+                   (strncmp(s_track_title, s_ui_last_title,
+                            sizeof(s_track_title)) != 0) ||
+                   (strncmp(s_track_artist, s_ui_last_artist,
+                            sizeof(s_track_artist)) != 0);
 
-    /* Top Status Bar: Background Navy */
-    lcd_fill_rect(0, 0, LCD_WIDTH - 1, 24, LCD_COLOR_NAVY);
-    snprintf(line, sizeof(line), "IP:%s  V:%u%%", s_ip_str, s_volume);
-    lcd_show_string(6, 4, line, LCD_COLOR_CYAN, LCD_COLOR_NAVY);
+    if (changed) {
+        char line[40];
 
-    /* Main Area: Background Black */
-    lcd_fill_rect(0, 25, LCD_WIDTH - 1, 185, LCD_COLOR_BLACK);
+        /* Top Status Bar: Background Navy */
+        lcd_fill_rect(0, 0, LCD_WIDTH - 1, 24, LCD_COLOR_NAVY);
+        snprintf(line, sizeof(line), "IP:%s  V:%u%%", s_ip_str, s_volume);
+        lcd_show_string(6, 4, line, LCD_COLOR_CYAN, LCD_COLOR_NAVY);
 
-    /* Stream State Header */
-    if (s_is_streaming) {
-        lcd_show_string(20, 36, "[AirPlay Streaming]", LCD_COLOR_GREEN, LCD_COLOR_BLACK);
-    } else {
-        lcd_show_string(20, 36, "[AirPlay 1 Receiver]", LCD_COLOR_YELLOW, LCD_COLOR_BLACK);
+        /* Main Area: Background Black */
+        lcd_fill_rect(0, 25, LCD_WIDTH - 1, 185, LCD_COLOR_BLACK);
+
+        /* Stream State Header */
+        if (streaming) {
+            lcd_show_string(20, 36, "[AirPlay Streaming]", LCD_COLOR_GREEN, LCD_COLOR_BLACK);
+        } else {
+            lcd_show_string(20, 36, "[AirPlay 1 Receiver]", LCD_COLOR_YELLOW, LCD_COLOR_BLACK);
+        }
+
+        /* Track Metadata */
+        lcd_show_string(10, 65, "Track:", LCD_COLOR_GRAY, LCD_COLOR_BLACK);
+        lcd_show_string(10, 85, s_track_title, LCD_COLOR_WHITE, LCD_COLOR_BLACK);
+
+        lcd_show_string(10, 115, "Artist:", LCD_COLOR_GRAY, LCD_COLOR_BLACK);
+        lcd_show_string(10, 135, s_track_artist, LCD_COLOR_WHITE, LCD_COLOR_BLACK);
+
+        lcd_show_string(10, 160, "Format: ALAC 44.1k Stereo", LCD_COLOR_DARKCYAN, LCD_COLOR_BLACK);
+
+        /* VU Labels */
+        lcd_fill_rect(0, 186, LCD_WIDTH - 1, LCD_HEIGHT - 1, LCD_COLOR_BLACK);
+        lcd_show_string(6, 195, "L:", LCD_COLOR_WHITE, LCD_COLOR_BLACK);
+        lcd_show_string(6, 215, "R:", LCD_COLOR_WHITE, LCD_COLOR_BLACK);
+
+        snprintf(s_ui_last_title, sizeof(s_ui_last_title), "%s", s_track_title);
+        snprintf(s_ui_last_artist, sizeof(s_ui_last_artist), "%s", s_track_artist);
+        s_ui_last_volume    = s_volume;
+        s_ui_last_streaming = streaming;
+        s_ui_full_repaint   = false;
     }
 
-    /* Track Metadata */
-    lcd_show_string(10, 65, "Track:", LCD_COLOR_GRAY, LCD_COLOR_BLACK);
-    lcd_show_string(10, 85, s_track_title, LCD_COLOR_WHITE, LCD_COLOR_BLACK);
-
-    lcd_show_string(10, 115, "Artist:", LCD_COLOR_GRAY, LCD_COLOR_BLACK);
-    lcd_show_string(10, 135, s_track_artist, LCD_COLOR_WHITE, LCD_COLOR_BLACK);
-
-    lcd_show_string(10, 160, "Format: ALAC 44.1k Stereo", LCD_COLOR_DARKCYAN, LCD_COLOR_BLACK);
-
-    /* VU Peak Level Meters at Bottom (y=190..235) */
+    /* VU Peak Level Meters (bottom, y=190..235): cheap partial refresh */
     uint16_t vu_l = (uint16_t)(((uint32_t)s_peak_l * 200U) / 32768U);
     uint16_t vu_r = (uint16_t)(((uint32_t)s_peak_r * 200U) / 32768U);
     if (vu_l > 200) vu_l = 200;
     if (vu_r > 200) vu_r = 200;
-
-    lcd_fill_rect(0, 186, LCD_WIDTH - 1, LCD_HEIGHT - 1, LCD_COLOR_BLACK);
-    lcd_show_string(6, 195, "L:", LCD_COLOR_WHITE, LCD_COLOR_BLACK);
-    lcd_fill_rect(25, 198, 25 + vu_l, 206, (vu_l > 170) ? LCD_COLOR_RED : ((vu_l > 120) ? LCD_COLOR_YELLOW : LCD_COLOR_GREEN));
-
-    lcd_show_string(6, 215, "R:", LCD_COLOR_WHITE, LCD_COLOR_BLACK);
-    lcd_fill_rect(25, 218, 25 + vu_r, 226, (vu_r > 170) ? LCD_COLOR_RED : ((vu_r > 120) ? LCD_COLOR_YELLOW : LCD_COLOR_GREEN));
+    render_vu_bar(198, vu_l);
+    render_vu_bar(218, vu_r);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -272,6 +329,22 @@ static void render_ui(void)
 /* -------------------------------------------------------------------------- */
 static void update_led_visualizer(void)
 {
+    /* led_matrix_show() locks IRQs for ~570 us of bit-banged WS2812 timing;
+     * skip the transfer entirely when the frame would be identical. */
+    static bool last_streaming = false;
+    static uint8_t last_level = 0xFF;
+    static bool last_clip = false;
+
+    bool clip = (s_peak_l > 20000) || (s_peak_r > 20000);
+    uint8_t level = (uint8_t)(((uint32_t)(s_peak_l + s_peak_r) / 2U * 16U) / 32768U);
+
+    if (s_is_streaming == last_streaming && level == last_level && clip == last_clip) {
+        return;
+    }
+    last_streaming = s_is_streaming;
+    last_level = level;
+    last_clip = clip;
+
     if (!s_is_streaming) {
         /* Idle breathing glow on center LED */
         led_matrix_clear();
@@ -281,7 +354,6 @@ static void update_led_visualizer(void)
     }
 
     /* Active music visualization: map peak levels across 19 LEDs */
-    uint8_t level = (uint8_t)(((uint32_t)(s_peak_l + s_peak_r) / 2U * 16U) / 32768U);
     for (uint8_t i = 0; i < 16; i++) {
         if (i <= level) {
             uint8_t r = (i > 11) ? 40 : 0;
@@ -324,10 +396,49 @@ static void start_airplay_services(uint32_t ip_addr)
 }
 
 /* -------------------------------------------------------------------------- */
+/* Stall watchdog                                                             */
+/* -------------------------------------------------------------------------- */
+/* Observed failure: mid-stream the RW007 stops delivering unicast frames (the
+ * SPI link stays healthy, no DISCONNECT event, RSSI queries still answer) and
+ * never recovers by itself. Silence on the audio socket while a session is live
+ * and the sender has not paused is treated as that stall and answered by leaving
+ * and rejoining the access point. This is a workaround for the symptom, not a
+ * fix for its cause (unknown; the chip firmware is closed). */
+#define STALL_REJOIN_MS       5000U    /* silent this long while RECORDING => stalled */
+#define STALL_RETRY_GAP_MS    15000U   /* minimum spacing between rejoin attempts */
+#define STALL_MAX_REJOINS     3        /* give up after this many in a row */
+
+static bool wifi_rejoin(const char *ssid, const char *pass)
+{
+    printk("[Wi-Fi] WATCHDOG: audio stalled, rejoining '%s'\n", ssid);
+    struct net_if *iface = rw007_netif_get();
+
+    rw007_wifi_disconnect();
+    k_msleep(500);
+    if (!rw007_wifi_connect(ssid, pass)) {
+        printk("[Wi-Fi] WATCHDOG: rejoin failed\n");
+        return false;
+    }
+
+    k_sem_reset(&s_ip_sem);
+    net_dhcpv4_restart(iface);
+    bool leased = (k_sem_take(&s_ip_sem, K_SECONDS(10)) == 0);
+    printk("[Wi-Fi] WATCHDOG: rejoined, DHCP %s\n", leased ? "bound" : "no event (link may still be up)");
+    return true;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main Application Entry Point                                               */
 /* -------------------------------------------------------------------------- */
 int main(void)
 {
+    /* Drop the UI thread below every real-time producer. Zephyr's default
+     * main priority (0) would preempt the RTP receive thread (4), the RW007
+     * RX thread (3) and the audio producer (1) for ~6-8 ms every render tick,
+     * building a packet backlog that starves the jitter buffer and stutters
+     * the audio stream. */
+    k_thread_priority_set(k_current_get(), 10);
+
     printk("\n==================================================\n");
     printk(" RT-Thread RT-Spark AirPlay 1 Receiver (Zephyr RTOS)\n");
     printk(" Hardware: STM32F407ZGT6 + RW007 Wi-Fi + ES8388\n");
@@ -363,7 +474,6 @@ int main(void)
         strncpy(pass, CONFIG_WIFI_PASS, sizeof(pass) - 1);
         has_creds = true;
     }
-
     /* 5. Initialize RW007 Wi-Fi Module */
     printk("[Init] Initializing RW007 Wi-Fi Module...\n");
     if (!rw007_wifi_init()) {
@@ -417,6 +527,21 @@ int main(void)
                 s_wifi_connected = true;
                 wifi_storage_save(ssid, pass);
                 printk("[Wi-Fi] DHCP lease acquired!\n");
+
+                /* Streaming needs the radio awake: report, disable, and verify
+                 * the module's power-save mode (encoding undocumented, so the
+                 * raw readback is logged to confirm what actually took effect). */
+                int32_t ps_before = -1, ps_after = -1, rssi = 0;
+                rw007_wifi_power_save_get(&ps_before);
+                rw007_wifi_power_save_set(0);
+                rw007_wifi_power_save_get(&ps_after);
+                if (rw007_wifi_get_rssi(&rssi) == 0) {
+                    printk("[Wi-Fi] power_save %d -> %d, RSSI %d dBm\n",
+                           (int)ps_before, (int)ps_after, (int)rssi);
+                } else {
+                    printk("[Wi-Fi] power_save %d -> %d, RSSI unavailable\n",
+                           (int)ps_before, (int)ps_after);
+                }
             } else {
                 printk("[Wi-Fi] DHCP lease timed out!\n");
                 net_dhcpv4_stop(iface);
@@ -460,8 +585,27 @@ int main(void)
 
     /* 7. Super Loop: UI rendering, LED visualizer, Button polling */
     uint32_t last_ui_tick = 0;
+    uint32_t last_rssi_tick = 0;
+    uint32_t last_rejoin_tick = 0;
+    uint32_t rejoins_in_row = 0;
     while (1) {
         uint32_t now = k_uptime_get_32();
+
+        /* Stall watchdog (station mode only; the SoftAP fallback has nothing to rejoin) */
+        if (s_wifi_connected && s_is_streaming) {
+            uint32_t stalled = raop_rtp_stalled_ms();
+            if (stalled < 1000U) {
+                rejoins_in_row = 0;                       /* audio is flowing again */
+            } else if (stalled >= STALL_REJOIN_MS &&
+                       rejoins_in_row < STALL_MAX_REJOINS &&
+                       (last_rejoin_tick == 0 || (now - last_rejoin_tick) >= STALL_RETRY_GAP_MS)) {
+                rejoins_in_row++;
+                printk("[Wi-Fi] WATCHDOG: no audio for %u ms (attempt %u/%u)\n",
+                       (unsigned)stalled, (unsigned)rejoins_in_row, (unsigned)STALL_MAX_REJOINS);
+                (void)wifi_rejoin(ssid, pass);
+                last_rejoin_tick = k_uptime_get_32();
+            }
+        }
 
         /* Poll navigation buttons */
         button_id_t btn = buttons_poll();
@@ -475,6 +619,19 @@ int main(void)
             else s_volume = 0;
             audio_set_volume(s_volume);
             printk("[Button] Volume DOWN -> %u%%\n", s_volume);
+        }
+
+        /* Link-quality sample while streaming. Runs on this low-priority thread
+         * on purpose: the query waits on the module and can block for seconds
+         * when the link stalls, which must never happen on the audio path. */
+        if (s_is_streaming && (now - last_rssi_tick) >= 2000) {
+            last_rssi_tick = now;
+            int32_t rssi = 0;
+            if (rw007_wifi_get_rssi(&rssi) == 0) {
+                printk("[Wi-Fi] RSSI %d dBm\n", (int)rssi);
+            } else {
+                printk("[Wi-Fi] RSSI query failed\n");
+            }
         }
 
         /* Periodic UI & LED update */
