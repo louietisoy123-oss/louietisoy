@@ -1,0 +1,9 @@
+# Spark_USB_DAC
+#
+# The SAMPLE_USBD_* options (manufacturer/product strings, VID/PID, power attributes)
+# are defined by Zephyr's shared USB sample helper. They only exist if this file pulls
+# the definitions in, exactly as the in-tree USB samples do.
+
+source "samples/subsys/usb/common/Kconfig.sample_usbd"
+
+source "Kconfig.zephyr"

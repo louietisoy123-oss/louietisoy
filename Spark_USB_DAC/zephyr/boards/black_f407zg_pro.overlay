@@ -1,0 +1,86 @@
+/*
+ * Board overlay: Spark USB DAC.
+ *
+ * 1. Console on USART1 (PA9/PA10), which the Spark board wires to the ST-LINK
+ *    virtual COM port (the upstream board file defaults to USART2).
+ * 2. A USB Audio Class 2 playback device on the USB_DEVICE Type-C port
+ *    (OTG FS, PA11/PA12; zephyr_udc0 is already enabled by the board file).
+ *
+ * The USB port and its pins are taken from the Spark schematic (sheet 11, CN4
+ * "TYPEC-USB2.0", nets USB_OTG_FS_P/N on PA12/PA11) and from the Zephyr board file.
+ */
+
+#include <zephyr/dt-bindings/usb/audio.h>
+
+/ {
+	chosen {
+		zephyr,console = &usart1;
+		zephyr,shell-uart = &usart1;
+	};
+
+	uac2_dac: usb_audio2 {
+		compatible = "zephyr,uac2";
+		status = "okay";
+		full-speed;
+		audio-function = <AUDIO_FUNCTION_OTHER>;
+
+		uac_aclk: aclk {
+			compatible = "zephyr,uac2-clock-source";
+			clock-type = "internal-programmable";
+			frequency-control = "host-programmable";
+			/* Sorted ascending (checked at compile time); the highest rate sets the
+			 * isochronous packet size. Each rate has its own PLLI2S setting in
+			 * src/i2s_out.c. (The earlier "zero-length packets" symptom at 96 kHz was
+			 * the missing incomplete-ISO recovery, not the format.) */
+			sampling-frequencies = <44100 48000 96000>;
+		};
+
+		dac_in_terminal: dac_in_terminal {
+			compatible = "zephyr,uac2-input-terminal";
+			clock-source = <&uac_aclk>;
+			terminal-type = <USB_TERMINAL_STREAMING>;
+			front-left;
+			front-right;
+		};
+
+		dac_out_terminal: dac_out_terminal {
+			compatible = "zephyr,uac2-output-terminal";
+			data-source = <&dac_in_terminal>;
+			clock-source = <&uac_aclk>;
+			terminal-type = <OUTPUT_TERMINAL_HEADPHONES>;
+		};
+
+		as_iso_out: out_interface {
+			compatible = "zephyr,uac2-audio-streaming";
+			linked-terminal = <&dac_in_terminal>;
+			/* 24-bit samples in 3-byte slots */
+			subslot-size = <3>;
+			bit-resolution = <24>;
+		};
+	};
+};
+
+&pinctrl {
+	usart1_tx_pa9: usart1_tx_pa9 {
+		pinmux = <STM32_PINMUX('A', 9, AF7)>;
+		bias-disable;
+	};
+
+	usart1_rx_pa10: usart1_rx_pa10 {
+		pinmux = <STM32_PINMUX('A', 10, AF7)>;
+		bias-disable;
+	};
+};
+
+&usart1 {
+	status = "okay";
+	current-speed = <115200>;
+	pinctrl-0 = <&usart1_tx_pa9 &usart1_rx_pa10>;
+	pinctrl-names = "default";
+};
+
+/*
+ * I2S3 and DMA1 Stream 5 are driven at register level by src/i2s_out.c (circular DMA,
+ * no per-block restarts), so Zephyr's I2S and DMA drivers are deliberately left
+ * disabled here: enabling them would make two drivers fight over the same hardware.
+ */
